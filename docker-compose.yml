@@ -1,0 +1,13 @@
+services:
+  builder:
+    build: .
+    image: atomet-builder
+    volumes:
+      - ".:/src"          # プロジェクトをコンテナ内の /src にマウント
+      - "atomet-buildcache:/build"  # Buildroot ビルドキャッシュ (named volume)
+    cap_add:
+      - SYS_ADMIN         # sudo mknod (initramfs デバイスノード作成) に必要
+    command: tail -f /dev/null  # 起動維持 (docker exec でシェル接続)
+
+volumes:
+  atomet-buildcache:

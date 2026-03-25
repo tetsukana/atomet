@@ -1,0 +1,3 @@
+#!/bin/sh
+# Dropbear is started with custom config by S80sshd
+exit 0

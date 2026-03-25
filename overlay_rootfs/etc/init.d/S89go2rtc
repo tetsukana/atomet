@@ -1,0 +1,33 @@
+#!/bin/sh
+# go2rtc - multi-protocol video streaming server
+# Starts before atometd (S90) so the API is ready when atometd's proxy connects.
+PIDFILE=/var/run/go2rtc.pid
+CONFIG=/etc/go2rtc.yaml
+
+case "$1" in
+    start)
+        printf "Starting go2rtc: "
+        go2rtc -config "$CONFIG" &
+        echo $! > "$PIDFILE"
+        echo "OK"
+        ;;
+    stop)
+        printf "Stopping go2rtc: "
+        if [ -f "$PIDFILE" ]; then
+            kill "$(cat "$PIDFILE")" 2>/dev/null || true
+            rm -f "$PIDFILE"
+        else
+            killall go2rtc 2>/dev/null || true
+        fi
+        echo "OK"
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

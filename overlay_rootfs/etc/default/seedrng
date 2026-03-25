@@ -1,0 +1,2 @@
+# seedrng の保存先を /tmp にする (/var/lib は squashfs で read-only)
+SEEDRNG_ARGS="--seed-dir=/tmp/seedrng --skip-credit"

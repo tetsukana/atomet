@@ -1,0 +1,65 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: atomet-builder:latest
+          cache-from: type=gha,scope=builder-image
+          cache-to: type=gha,mode=max,scope=builder-image
+
+      - name: Restore Buildroot cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/br-build
+          key: br-build-${{ hashFiles('configs/**', 'custompackages/**', 'initramfs_skeleton/**') }}
+          restore-keys: br-build-
+
+      - name: Build firmware
+        run: |
+          mkdir -p /tmp/br-build output
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -v "/tmp/br-build:/build" \
+            --cap-add SYS_ADMIN \
+            atomet-builder:latest
+
+      - name: Fix cache permissions
+        if: always()
+        run: sudo chmod -R a+r /tmp/br-build
+
+      - name: Save Buildroot cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/br-build
+          key: br-build-${{ hashFiles('configs/**', 'custompackages/**', 'initramfs_skeleton/**') }}-${{ github.run_id }}
+
+      - name: Upload firmware artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: output/
+          retention-days: 30

@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# atometd
+#
+
+DAEMON=/usr/bin/atometd
+DAEMON_SD=/media/mmc/atometd
+PIDFILE=/var/run/atometd.pid
+
+# SD カードにバイナリがあればそちらを優先（開発用）
+if [ -f "$DAEMON_SD" ] && [ -x "$DAEMON_SD" ]; then
+    DAEMON="$DAEMON_SD"
+fi
+
+[ -f "$DAEMON" ] || exit 0
+
+load_modules() {
+    # ISP・センサー等のカーネルモジュールをロード
+    #insmod /atom/system/driver/tx-isp-t31.ko isp_clk=100000000
+    insmod /media/mmc/tx-isp-t31-patched.ko isp_clk=100000000
+    insmod /atom/system/driver/avpu.ko
+    insmod /atom/system/driver/sinfo.ko
+    insmod /atom/system/driver/audio.ko spk_gpio=-1
+    insmod /atom/system/driver/sample_pwm_core.ko
+    insmod /atom/system/driver/sample_pwm_hal.ko
+    insmod /atom/system/driver/speaker_ctl.ko
+    insmod /atom/system/driver/sensor_gc2053_t31.ko data_interface=1
+}
+
+start() {
+    echo "Loading kernel modules..."
+    cp /atom/system/driver/tx-isp-t31.ko /media/mmc/tx-isp-t31.ko
+    load_modules
+    echo "Starting atometd..."
+    "$DAEMON" &
+    echo $! > "$PIDFILE"
+    echo "OK"
+}
+
+stop() {
+    echo "Stopping atometd..."
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+    fi
+    echo "OK"
+}
+
+case "$1" in
+    start)          start ;;
+    stop)           stop ;;
+    restart|reload) stop; start ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

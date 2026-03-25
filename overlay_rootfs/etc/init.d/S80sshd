@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# Dropbear SSH daemon
+# 公開鍵は SDカード(/media/mmc/authorized_keys) から読み込む
+#
+
+[ -f /usr/sbin/dropbear ] || exit 0
+[ -f /media/mmc/authorized_keys ] || {
+  echo "WARNING: /media/mmc/authorized_keys not found. SSH login disabled."
+  exit 0
+}
+
+start() {
+  echo "Starting sshd..."
+  # SSH host keys を jffs2 (NOR フラッシュ /dev/mtdblock6) に永続化
+  # SD カードより安全: SD は簡単に取り出して読めるが NOR フラッシュは専用機材が必要
+  # 2回目以降は生成スキップ → 起動高速化 + SSH ホスト鍵変化警告なし
+  HOST_KEY=/tmp/dropbear_ed25519_host_key
+  JFFS2_MNT=/tmp/dropbear_jffs2
+  mkdir -p "$JFFS2_MNT"
+  if mount -t jffs2 /dev/mtdblock6 "$JFFS2_MNT" 2>/dev/null; then
+    JFFS2_KEY="$JFFS2_MNT/dropbear_ed25519_host_key"
+    [ -f "$JFFS2_KEY" ] || dropbearkey -t ed25519 -f "$JFFS2_KEY"
+    cp "$JFFS2_KEY" "$HOST_KEY"
+    umount "$JFFS2_MNT"
+  else
+    # フォールバック: /tmp に生成 (起動ごとに再生成)
+    echo "WARNING: jffs2 mount failed, SSH host key will regenerate each boot"
+    [ -f "$HOST_KEY" ] || dropbearkey -t ed25519 -f "$HOST_KEY"
+  fi
+  rmdir "$JFFS2_MNT" 2>/dev/null || true
+
+  # authorized_keys を /root/.ssh に bind-mount (/root は squashfs で read-only)
+  mkdir -p /tmp/root_ssh
+  cp /media/mmc/authorized_keys /tmp/root_ssh/authorized_keys
+  chmod 700 /tmp/root_ssh
+  chmod 600 /tmp/root_ssh/authorized_keys
+  mount --bind /tmp/root_ssh /root/.ssh
+
+  echo "Starting dropbear..."
+  dropbear \
+    -r "$HOST_KEY" \
+    -s
+  echo "OK"
+}
+
+stop() {
+  echo "Stopping dropbear..."
+  killall dropbear 2>/dev/null || true
+  umount /root/.ssh 2>/dev/null || true
+  echo "OK"
+}
+
+restart() {
+  stop
+  start
+}
+
+case "$1" in
+  start)   start ;;
+  stop)    stop ;;
+  restart|reload) restart ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac
+
+exit 0

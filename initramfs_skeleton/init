@@ -1,0 +1,82 @@
+#!/bin/sh
+# devtmpfs does not get automounted for initramfs
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+sleep 1
+
+mkdir -p /boot
+mkdir -p /rootfs
+if blkid | grep '^/dev/mmcblk0p2:.*TYPE="exfat"$' ; then
+  fsck.fat -a /dev/mmcblk0p1
+  mount -t vfat /dev/mmcblk0p1 /boot -o rw,umask=0000,dmask=0000
+  fsck.exfat -a /dev/mmcblk0p2
+  mount -t exfat /dev/mmcblk0p2 /rootfs -o rw,umask=0000,dmask=0000
+else
+  fsck.fat -a /dev/mmcblk0p1
+  mount -t vfat /dev/mmcblk0p1 /rootfs -o rw,umask=0000,dmask=0000
+  mount -o bind /rootfs /boot
+fi
+
+[ -f /boot/initramfs-debug ] && /bin/sh
+
+if [ -f /rootfs/update/atomcam_tools.zip ] ; then
+  (cd /rootfs/update; unzip atomcam_tools.zip -o factory_t31_ZMC6tiIDQN rootfs_hack.ext2 rootfs_hack.squashfs)
+  rm -rf /rootfs/update/atomcam_tools.zip
+fi
+
+if [ -f /rootfs/update/rootfs_hack.ext2 ] ; then
+  fsize=`ls -l /rootfs/update/rootfs_hack.ext2  | { read _ _ _ _ size _ && echo $size; }`
+  bsize=`hexdump -s 0x404 -n 4 -e '1/4 "%d\n"' /rootfs/update/rootfs_hack.ext2`
+  psize=$(($bsize * 1024))
+  if [ "$fsize" = "$psize" ]; then
+    mv -f /rootfs/update/rootfs_hack.ext2 /rootfs/rootfs_hack.ext2
+    rm -rf /rootfs/swap /rootfs/rootfs_hack.squashfs
+    sync
+  fi
+fi
+if [ -f /rootfs/update/rootfs_hack.squashfs ] ; then
+  fsize=`ls -l /rootfs/update/rootfs_hack.squashfs  | { read _ _ _ _ size _ && echo $size; }`
+  bsize=`hexdump -s 0x28 -n 4 -e '1/4 "%d\n"' /rootfs/update/rootfs_hack.squashfs`
+  psize=$((($bsize + 4095) / 4096 * 4096))
+  if [ "$fsize" = "$psize" ]; then
+    mv -f /rootfs/update/rootfs_hack.squashfs /rootfs/rootfs_hack.squashfs
+    rm -rf /rootfs/swap /rootfs/rootfs_hack.ext2
+    sync
+  fi
+fi
+
+if [ -f /rootfs/update/factory_t31_ZMC6tiIDQN ] ; then
+  fsize=`ls -l /rootfs/update/factory_t31_ZMC6tiIDQN | { read _ _ _ _ size _ && echo $size; }`
+  hsize=`hexdump -s 0x0c -n 4 -e '"0x" 4/1 "%02x" "\n"' /rootfs/update/factory_t31_ZMC6tiIDQN`
+  tsize=$(($hsize + 64))
+  if [ "$fsize" = "$tsize" ] ; then
+    mv -f /rootfs/update/factory_t31_ZMC6tiIDQN /boot/factory_t31_ZMC6tiIDQN
+    sync
+    exit # panic & reboot
+  fi
+fi
+
+if [ -f /rootfs/rootfs_hack.squashfs -a -f /rootfs/rootfs_hack.ext2 ] ; then
+  fsize=`ls -l /rootfs/update/rootfs_hack.squashfs  | { read _ _ _ _ size _ && echo $size; }`
+  bsize=`hexdump -s 0x28 -n 4 -e '1/4 "%d\n"' /rootfs/update/rootfs_hack.squashfs`
+  psize=$((($bsize + 4095) / 4096 * 4096))
+  if [ "$fsize" = "$psize" ]; then
+    rm -rf /rootfs/rootfs_hack.ext2
+  else
+    rm -rf /rootfs/rootfs_hack.squashfs
+  fi
+  sync
+fi
+
+mkdir -p /newroot
+[ -f /rootfs/rootfs_hack.squashfs ] && mount -t squashfs -o loop /rootfs/rootfs_hack.squashfs /newroot
+[ -f /rootfs/rootfs_hack.ext2 ] && mount -t ext2 -o loop /rootfs/rootfs_hack.ext2 /newroot
+mount -o bind,remount,ro /boot
+mount --move /dev /newroot/dev
+mount --move /sys /newroot/sys
+mount --move /proc /newroot/proc
+mount --move /rootfs /newroot/media/mmc
+mount --move /boot /newroot/boot
+exec switch_root /newroot /sbin/init

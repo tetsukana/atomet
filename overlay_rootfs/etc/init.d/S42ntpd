@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# NTP time synchronization
+# SDカードに time.ini があればオフライン時のフォールバックとして使う
+#
+
+case "$1" in
+    start)
+        echo "Starting ntpd..."
+        # 一発同期 (バックグラウンドで起動し最大30秒待つ)
+        /usr/sbin/ntpd -gq -p /var/run/ntpd-init.pid ntp.nict.jp &
+        NTP_PID=$!
+        n=0; while [ $n -lt 30 ] && kill -0 $NTP_PID 2>/dev/null; do
+            sleep 1; n=$((n + 1))
+        done
+        kill $NTP_PID 2>/dev/null || true
+        wait $NTP_PID 2>/dev/null || true
+        if [ "$(date +%Y)" -lt 2025 ] && [ -f /media/mmc/time.ini ]; then
+            # NTP 失敗 + オフライン: SDカードの保存時刻で補正
+            date -s @"$(sed -ne 's/utc=//p' /media/mmc/time.ini)"
+        fi
+        /usr/sbin/ntpd ntp.nict.jp
+        echo "OK"
+        ;;
+    stop)
+        echo "Stopping ntpd..."
+        killall ntpd 2>/dev/null || true
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?

@@ -1,0 +1,21 @@
+#!/bin/sh
+
+HOSTNAME_FILE="/media/mmc/hostname"
+DEFAULT_HOSTNAME="atomet"
+
+case "$1" in
+  start)
+    if [ ! -f "$HOSTNAME_FILE" ]; then
+      echo "$DEFAULT_HOSTNAME" > "$HOSTNAME_FILE"
+    fi
+    HNAME=$(cat "$HOSTNAME_FILE" | tr -d '[:space:]')
+    [ -z "$HNAME" ] && HNAME="$DEFAULT_HOSTNAME"
+    hostname "$HNAME"
+    ;;
+  stop)
+    ;;
+  *)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac

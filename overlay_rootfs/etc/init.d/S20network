@@ -1,0 +1,156 @@
+#!/bin/sh
+#
+# Network initialization for ATOM Cam2
+# Priority: USB-Ethernet (development) → WiFi/ATBM (production)
+#
+# /atom は S15mountatom によって起動時にマウント済みであること。
+#
+
+start_network() {
+    # SoC GPIO/PHY レジスタ設定 (T31 固有)
+    devmem 0x10011110 32 0x6e094800
+    devmem 0x10011138 32 0x300
+    devmem 0x10011134 32 0x300
+
+    ifconfig lo up
+
+    # --- USB-Ethernet (開発用フォールバック) ---
+    for driver in r8152 ax88179_178a ax8817x cdc_ether; do
+        modprobe $driver 2>/dev/null || true
+        sleep 0.5
+        if ip link show eth0 > /dev/null 2>&1; then
+            ifconfig eth0 up
+            udhcpc -i eth0 -x hostname:atomet -p /var/run/udhcpc.pid -b
+            count=0
+            while ! ifconfig eth0 | grep -q 'inet addr'; do
+                sleep 0.5
+                count=$((count + 1))
+                [ $count -ge 20 ] && break
+            done
+            ifconfig eth0 | grep -q 'inet addr' && return 0
+            rmmod $driver 2>/dev/null || true
+        fi
+    done
+
+    # --- WiFi (ATBM603x) ---
+    # atomcam_tools/atomskygaze と同様に /atom から設定ファイルをコピーしてから insmod する
+    [ -f /atom/usr/share/atbm603x_conf/atbm_txpwer_dcxo_cfg.txt ] && \
+        cp /atom/usr/share/atbm603x_conf/atbm_txpwer_dcxo_cfg.txt /tmp/
+    [ -f /atom/usr/share/atbm603x_conf/set_rate_power.txt ] && \
+        cp /atom/usr/share/atbm603x_conf/set_rate_power.txt /tmp/
+
+    # mmc_detect_test.ko が存在すれば先に読み込む (SDIO バス初期化用)
+    [ -f /atom/system/driver/mmc_detect_test.ko ] && \
+        insmod /atom/system/driver/mmc_detect_test.ko 2>/dev/null || true
+
+    insmod /lib/modules/atbm603x_wifi_sdio.ko
+    count=0
+    while [ "$(cat /sys/module/atbm603x_wifi_sdio/initstate 2>&1)" != "live" ]; do
+        sleep 0.5
+        count=$((count + 1))
+        [ $count -ge 20 ] && break
+    done
+    echo "LOG_ERR=OFF LOG_SCAN=OFF" > /sys/module/atbm603x_wifi_sdio/atbmfs/atbm_printk_mask 2>/dev/null || true
+
+    # wlan0 が現れるまで待機
+    count=0
+    while ! ip link show wlan0 > /dev/null 2>&1; do
+        sleep 0.5
+        count=$((count + 1))
+        [ $count -ge 20 ] && break
+    done
+
+    if ! ip link show wlan0 > /dev/null 2>&1; then
+        echo "ERROR: wlan0 did not appear"
+        return 1
+    fi
+
+    # WiFi 設定を読み込む: SDカード優先 → jffs2 内部設定
+    HWADDR=""
+    SSID=""
+    PSK=""
+
+    # /atom/configs が利用可能であれば使う (atomcam_tools 互換)
+    if [ -f /atom/configs/.product_config ]; then
+        HWADDR=$(awk -F "=" '/(CONFIG_INFO|NETRELATED_MAC)=/ { print substr($2,1,2) ":" substr($2,3,2) ":" substr($2,5,2) ":" substr($2,7,2) ":" substr($2,9,2) ":" substr($2,11,2); exit }' /atom/configs/.product_config 2>/dev/null)
+        UC=/atom/configs/.user_config
+        SSID=$(awk -F "=" '/^\[/ { f=0 } /^\[NET\]/ { f=1 } f && /ssid=/     { gsub(/\/$/, "", $2); print $2; exit }' "$UC" 2>/dev/null)
+        PSK=$(awk  -F "=" '/^\[/ { f=0 } /^\[NET\]/ { f=1 } f && /password=/ { gsub(/\/$/, "", $2); print $2; exit }' "$UC" 2>/dev/null)
+    else
+        # jffs2 (/dev/mtdblock6) から直接読む
+        ATOM_CFG=/tmp/atom_configs
+        mkdir -p "$ATOM_CFG"
+        if mount -t jffs2 /dev/mtdblock6 "$ATOM_CFG" 2>/dev/null; then
+            UC="$ATOM_CFG/.user_config"
+            SSID=$(awk -F "=" '/^\[/ { f=0 } /^\[NET\]/ { f=1 } f && /ssid=/     { gsub(/\/$/, "", $2); print $2; exit }' "$UC" 2>/dev/null)
+            [ -z "$SSID" ] && [ -f "$ATOM_CFG/.wifissid" ]   && SSID=$(cat "$ATOM_CFG/.wifissid")
+            PSK=$(awk  -F "=" '/^\[/ { f=0 } /^\[NET\]/ { f=1 } f && /password=/ { gsub(/\/$/, "", $2); print $2; exit }' "$UC" 2>/dev/null)
+            [ -z "$PSK"  ] && [ -f "$ATOM_CFG/.wifipasswd" ] && PSK=$(cat "$ATOM_CFG/.wifipasswd")
+            HWADDR=$(awk -F "=" '/(CONFIG_INFO|NETRELATED_MAC)=/ { print substr($2,1,2) ":" substr($2,3,2) ":" substr($2,5,2) ":" substr($2,7,2) ":" substr($2,9,2) ":" substr($2,11,2); exit }' "$ATOM_CFG/.product_config" 2>/dev/null)
+            umount "$ATOM_CFG"
+        fi
+        rmdir "$ATOM_CFG" 2>/dev/null
+    fi
+
+    # wpa_supplicant.conf: SDカード優先、なければ内部設定から生成
+    WPA_CONF=/tmp/wpa_supplicant.conf
+    if [ -f /media/mmc/wpa_supplicant.conf ]; then
+        cp /media/mmc/wpa_supplicant.conf "$WPA_CONF"
+    elif [ -n "$SSID" ]; then
+        cat > "$WPA_CONF" << EOF
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+network={
+  ssid="$SSID"
+  psk="$PSK"
+  scan_ssid=1
+}
+EOF
+    else
+        echo "ERROR: WiFi credentials not found. Place wpa_supplicant.conf on /media/mmc/."
+        return 1
+    fi
+
+    [ -n "$HWADDR" ] && ifconfig wlan0 hw ether "$HWADDR" 2>/dev/null || true
+    wpa_supplicant -D nl80211 -i wlan0 -c "$WPA_CONF" -B
+    udhcpc -i wlan0 -x hostname:atomet -p /var/run/udhcpc.pid -b &
+
+    count=0
+    while ! ifconfig wlan0 | grep -q 'inet addr'; do
+        sleep 0.5
+        count=$((count + 1))
+        [ $count -ge 40 ] && break
+    done
+
+    ifconfig wlan0 | grep -q 'inet addr' && return 0
+    echo "WARNING: WiFi did not get an IP address"
+    return 1
+}
+
+stop_network() {
+    killall wpa_supplicant 2>/dev/null || true
+    killall udhcpc 2>/dev/null || true
+    ifconfig wlan0 down 2>/dev/null || true
+    ifconfig eth0 down 2>/dev/null || true
+}
+
+case "$1" in
+    start)
+        echo "Starting network..."
+        start_network && echo "OK" || echo "FAIL"
+        ;;
+    stop)
+        echo "Stopping network..."
+        stop_network
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

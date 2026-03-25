@@ -1,0 +1,4 @@
+#!/bin/sh
+# OpenSSH sshd は無効 (Dropbear を S80sshd で起動)
+# sftp-server バイナリのみ利用する
+exit 0

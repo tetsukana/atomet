@@ -1,0 +1,30 @@
+#!/bin/sh
+# zram swap (32MB compressed RAM)
+case "$1" in
+    start)
+        if [ ! -b /dev/zram0 ]; then
+            echo "zram0 not found, skipping"
+            exit 0
+        fi
+        # lz4 が使えれば速い、なければデフォルト (lzo) にフォールバック
+        if grep -q lz4 /sys/block/zram0/comp_algorithm 2>/dev/null; then
+            echo lz4 > /sys/block/zram0/comp_algorithm
+        fi
+        echo 32M > /sys/block/zram0/disksize
+        mkswap /dev/zram0 -L zram0
+        swapon -p 10 /dev/zram0
+        echo "zram swap enabled (32MB)"
+        ;;
+    stop)
+        swapoff /dev/zram0 2>/dev/null || true
+        echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

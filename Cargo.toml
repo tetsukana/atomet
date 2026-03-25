@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/atometd",
+    "crates/isvp-sys",
+    "crates/solver",
+    "crates/imgproc",
+]
+resolver = "3"
+
+[profile.release]
+panic = "abort"

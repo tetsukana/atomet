@@ -1,0 +1,40 @@
+#!/bin/sh
+#
+# Mount original Wyze/AtomCam firmware from NOR flash
+#
+# /atom        : squashfs  /dev/mtdblock2 (SPI NOR rootfs)
+# /atom/system : squashfs  /dev/mtdblock3 (SPI NOR system)
+#
+# atomcam_tools の S20mountfs を参考にしている。
+# ネットワーク初期化より前に実行し、atbm603x ドライバが必要とする
+# キャリブレーション設定ファイルを /atom/ 経由でアクセス可能にする。
+#
+
+case "$1" in
+    start)
+        # mtdblock2 を /atom にマウント
+        # squashfs を直接マウントできない場合は dd でSDカードにコピーしてからマウント
+        if ! mount -t squashfs -o ro /dev/mtdblock2 /atom 2>/dev/null; then
+            ATOM_SQ=/media/mmc/atom_root.squashfs
+            ss=$(ls -l "$ATOM_SQ" 2>/dev/null | awk '{print $5}')
+            [ "$ss" = "3997696" ] || dd if=/dev/mtdblock2 of="$ATOM_SQ" bs=16k count=244 2>/dev/null
+            mount -t squashfs -o ro "$ATOM_SQ" /atom
+        fi
+
+        # mtdblock3 を /atom/system にマウント
+        mount -t squashfs -o ro /dev/mtdblock3 /atom/system 2>/dev/null || true
+        ;;
+    stop)
+        umount /atom/system 2>/dev/null || true
+        umount /atom        2>/dev/null || true
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

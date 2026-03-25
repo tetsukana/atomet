@@ -1,0 +1,9 @@
+streams:
+  main: tcp://0.0.0.0:12345
+
+api:
+  listen: :1984
+  origin: '*'
+
+log:
+  level: warn
