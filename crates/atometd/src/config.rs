@@ -42,6 +42,12 @@ pub struct AppState {
     pub show_timestamp: bool,
     pub show_watermark: bool,
     pub timestamp_position: u32,
+    pub webhook_discord_url: String,
+    pub webhook_slack_url: String,
+    pub webhook_generic_url: String,
+    pub webhook_notify_startup: bool,
+    pub webhook_notify_detection_start: bool,
+    pub webhook_notify_detection_end: bool,
 }
 
 impl Default for AppState {
@@ -71,6 +77,12 @@ impl Default for AppState {
             show_timestamp: true,
             show_watermark: false,
             timestamp_position: 0,
+            webhook_discord_url: String::new(),
+            webhook_slack_url: String::new(),
+            webhook_generic_url: String::new(),
+            webhook_notify_startup: false,
+            webhook_notify_detection_start: false,
+            webhook_notify_detection_end: false,
         }
     }
 }
@@ -113,6 +125,18 @@ pub struct PersistConfig {
     pub auto_daynight: bool,
     #[serde(default)]
     pub timestamp_position: u32,
+    #[serde(default)]
+    pub webhook_discord_url: String,
+    #[serde(default)]
+    pub webhook_slack_url: String,
+    #[serde(default)]
+    pub webhook_generic_url: String,
+    #[serde(default)]
+    pub webhook_notify_startup: bool,
+    #[serde(default)]
+    pub webhook_notify_detection_start: bool,
+    #[serde(default)]
+    pub webhook_notify_detection_end: bool,
 }
 
 fn default_true() -> bool {
@@ -139,6 +163,12 @@ impl From<&AppState> for PersistConfig {
             solve_field_enabled: s.solve_field_enabled,
             auto_daynight: s.auto_daynight,
             timestamp_position: s.timestamp_position,
+            webhook_discord_url: s.webhook_discord_url.clone(),
+            webhook_slack_url: s.webhook_slack_url.clone(),
+            webhook_generic_url: s.webhook_generic_url.clone(),
+            webhook_notify_startup: s.webhook_notify_startup,
+            webhook_notify_detection_start: s.webhook_notify_detection_start,
+            webhook_notify_detection_end: s.webhook_notify_detection_end,
         }
     }
 }
@@ -159,6 +189,12 @@ impl AppState {
             solve_field_enabled: cfg.solve_field_enabled,
             auto_daynight: cfg.auto_daynight,
             timestamp_position: cfg.timestamp_position,
+            webhook_discord_url: cfg.webhook_discord_url,
+            webhook_slack_url: cfg.webhook_slack_url,
+            webhook_generic_url: cfg.webhook_generic_url,
+            webhook_notify_startup: cfg.webhook_notify_startup,
+            webhook_notify_detection_start: cfg.webhook_notify_detection_start,
+            webhook_notify_detection_end: cfg.webhook_notify_detection_end,
             ..Default::default()
         }
     }

@@ -67,6 +67,12 @@ export interface AppState {
 	analog_gain: number;
 	/** Manual digital gain. 0 = auto. */
 	digital_gain: number;
+	webhook_discord_url: string;
+	webhook_slack_url: string;
+	webhook_generic_url: string;
+	webhook_notify_startup: boolean;
+	webhook_notify_detection_start: boolean;
+	webhook_notify_detection_end: boolean;
 }
 
 export interface MeteorEvent {

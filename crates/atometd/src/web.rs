@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use crate::config::SharedAppState;
+use crate::webhook::WebhookEvent;
 use crate::websocket;
 
 /// Shared state passed to axum handlers via `with_state`.
@@ -26,6 +27,7 @@ pub struct WebState {
     pub detection_tx: broadcast::Sender<String>,
     pub stack_capture: Arc<AtomicBool>,
     pub mask: Arc<ArcSwap<Vec<u8>>>,
+    pub webhook_tx: tokio::sync::mpsc::Sender<WebhookEvent>,
 }
 
 /// Build the axum router.

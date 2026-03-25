@@ -14,6 +14,7 @@ mod stream;
 mod system;
 mod watchdog;
 mod web;
+mod webhook;
 mod websocket;
 
 use arc_swap::ArcSwap;
@@ -255,6 +256,14 @@ async fn main() {
         );
     });
 
+    // Webhook notification task
+    let (webhook_event_tx, webhook_event_rx) = mpsc::channel::<webhook::WebhookEvent>(32);
+    let shutdown_clone = Arc::clone(&shutdown);
+    let app_state_clone = Arc::clone(&app_state);
+    let webhook_detection_rx = detection_tx.subscribe();
+    tokio::spawn(webhook::webhook_task(webhook_detection_rx, webhook_event_rx, app_state_clone, shutdown_clone));
+    let _ = webhook_event_tx.send(webhook::WebhookEvent::Startup).await;
+
     // Daynight auto task
     let shutdown_clone = Arc::clone(&shutdown);
     let app_state_clone = Arc::clone(&app_state);
@@ -328,6 +337,7 @@ async fn main() {
         detection_tx,
         stack_capture: Arc::clone(&stack_capture),
         mask: Arc::clone(&mask_data),
+        webhook_tx: webhook_event_tx,
     };
     let app = web::build_router(web_state);
 

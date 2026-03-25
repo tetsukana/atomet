@@ -38,7 +38,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Some(resp) = handle_command(&text, &app_state).await && sender.send(Message::Text(resp)).await.is_err() { break; }
+                        if let Some(resp) = handle_command(&text, &app_state, &state.webhook_tx).await && sender.send(Message::Text(resp)).await.is_err() { break; }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -48,7 +48,11 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     }
 }
 
-async fn handle_command(text: &str, app_state: &crate::config::SharedAppState) -> Option<String> {
+async fn handle_command(
+    text: &str,
+    app_state: &crate::config::SharedAppState,
+    webhook_tx: &tokio::sync::mpsc::Sender<crate::webhook::WebhookEvent>,
+) -> Option<String> {
     let Ok(cmd) = serde_json::from_str::<serde_json::Value>(text) else {
         log::warn!("Invalid JSON command: {}", text);
         return None;
@@ -193,8 +197,14 @@ async fn handle_command(text: &str, app_state: &crate::config::SharedAppState) -
         }
         "set_detection" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                let was = state.detection_enabled;
                 state.detection_enabled = on;
                 log::info!("Detection set to {}", on);
+                if on && !was {
+                    let _ = webhook_tx.try_send(crate::webhook::WebhookEvent::DetectionStart);
+                } else if !on && was {
+                    let _ = webhook_tx.try_send(crate::webhook::WebhookEvent::DetectionEnd);
+                }
             }
         }
         "set_night_mode" => {
@@ -228,6 +238,39 @@ async fn handle_command(text: &str, app_state: &crate::config::SharedAppState) -
                 state.timestamp_position = pos as u32;
             }
         }
+        "set_webhook_discord" => {
+            if let Some(url) = cmd.get("value").and_then(|v| v.as_str()) {
+                state.webhook_discord_url = url.to_string();
+                log::info!("Discord webhook URL updated");
+            }
+        }
+        "set_webhook_slack" => {
+            if let Some(url) = cmd.get("value").and_then(|v| v.as_str()) {
+                state.webhook_slack_url = url.to_string();
+                log::info!("Slack webhook URL updated");
+            }
+        }
+        "set_webhook_generic" => {
+            if let Some(url) = cmd.get("value").and_then(|v| v.as_str()) {
+                state.webhook_generic_url = url.to_string();
+                log::info!("Generic webhook URL updated");
+            }
+        }
+        "set_webhook_notify_startup" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.webhook_notify_startup = on;
+            }
+        }
+        "set_webhook_notify_detection_start" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.webhook_notify_detection_start = on;
+            }
+        }
+        "set_webhook_notify_detection_end" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.webhook_notify_detection_end = on;
+            }
+        }
         "set_fps" => {
             if let Some(v) = cmd.get("value").and_then(|v| v.as_u64()) {
                 let fps = (v as u32).clamp(1, 30);
@@ -242,7 +285,15 @@ async fn handle_command(text: &str, app_state: &crate::config::SharedAppState) -
     }
 
     let new_state = Arc::new(state);
-    app_state.store(new_state);
+    app_state.store(Arc::clone(&new_state));
+
+    // Persist to disk on every change
+    tokio::spawn(async move {
+        if let Err(e) = crate::config::save_config(&new_state).await {
+            log::error!("Failed to save config: {}", e);
+        }
+    });
+
     None
 }
 

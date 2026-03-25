@@ -663,6 +663,11 @@ pub fn detection_task(
                         log::error!("failed to save stack: {}", e);
                     } else {
                         log::info!("saved detection stack: {}", path);
+                        let msg = format!(
+                            r#"{{"type":"meteor_stack","path":"{}","ts":"{}"}}"#,
+                            path, stack_ts.replace('/', "")
+                        );
+                        let _ = debug_tx.send(msg);
                     }
                     stack_active = false;
                 }

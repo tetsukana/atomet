@@ -7,13 +7,14 @@
 	let appState = $state<AppState | null>(null);
 	let wsConnected = $state(false);
 
-	type Tab = 'system' | 'detection' | 'record';
+	type Tab = 'system' | 'detection' | 'record' | 'webhook';
 	let activeTab = $state<Tab>('system');
 
 	const tabs: { id: Tab; label: string }[] = [
 		{ id: 'system',    label: 'System'    },
 		{ id: 'detection', label: 'Detection' },
 		{ id: 'record',    label: 'Record'    },
+		{ id: 'webhook',   label: 'Webhook'   },
 	];
 
 	function fmtExposure(us: number): string {
@@ -226,6 +227,59 @@
 						</div>
 					</div>
 				</section>
+			<!-- ── Webhook ───────────────────────────────── -->
+			{:else if activeTab === 'webhook'}
+				<section>
+					<h2>Endpoints</h2>
+					<div class="row">
+						<span>Discord</span>
+						<input
+							class="url-input"
+							type="text"
+							placeholder="https://discord.com/api/webhooks/..."
+							value={appState.webhook_discord_url}
+							onchange={(e) => send('set_webhook_discord', e.currentTarget.value)}
+						/>
+					</div>
+					<div class="row">
+						<span>Slack</span>
+						<input
+							class="url-input"
+							type="text"
+							placeholder="https://hooks.slack.com/services/..."
+							value={appState.webhook_slack_url}
+							onchange={(e) => send('set_webhook_slack', e.currentTarget.value)}
+						/>
+					</div>
+					<div class="row">
+						<span>Generic</span>
+						<input
+							class="url-input"
+							type="text"
+							placeholder="https://..."
+							value={appState.webhook_generic_url}
+							onchange={(e) => send('set_webhook_generic', e.currentTarget.value)}
+						/>
+					</div>
+				</section>
+				<section>
+					<h2>Notifications</h2>
+					<label class="row">
+						<span>Startup</span>
+						<input type="checkbox" checked={appState.webhook_notify_startup}
+							onchange={(e) => send('set_webhook_notify_startup', e.currentTarget.checked)} />
+					</label>
+					<label class="row">
+						<span>Detection Start</span>
+						<input type="checkbox" checked={appState.webhook_notify_detection_start}
+							onchange={(e) => send('set_webhook_notify_detection_start', e.currentTarget.checked)} />
+					</label>
+					<label class="row">
+						<span>Detection Stop</span>
+						<input type="checkbox" checked={appState.webhook_notify_detection_end}
+							onchange={(e) => send('set_webhook_notify_detection_end', e.currentTarget.checked)} />
+					</label>
+				</section>
 			{/if}
 
 		</div>
@@ -437,6 +491,29 @@
 	.select-wrap select option {
 		background: var(--input);
 		color: var(--text);
+	}
+
+	/* ── URL input ──────────────────────────── */
+	.url-input {
+		flex: 1;
+		min-width: 0;
+		background: var(--input);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		color: var(--text);
+		font-size: 0.8rem;
+		font-family: monospace;
+		padding: 0.4rem 0.6rem;
+		transition: border-color 0.15s;
+	}
+
+	.url-input:focus {
+		outline: none;
+		border-color: #3498db;
+	}
+
+	.url-input::placeholder {
+		color: var(--text4);
 	}
 
 	/* ── Schedule selects ───────────────────── */
