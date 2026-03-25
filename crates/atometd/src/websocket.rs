@@ -149,6 +149,48 @@ async fn handle_command(text: &str, app_state: &crate::config::SharedAppState) -
                 log::info!("Record set to {}", on);
             }
         }
+        "set_record_schedule" => {
+            if let (Some(s), Some(e)) = (
+                cmd.get("start").and_then(|v| v.as_u64()),
+                cmd.get("end").and_then(|v| v.as_u64()),
+            ) {
+                state.record_start_hour = s as u32;
+                state.record_end_hour = e as u32;
+                log::info!("Record schedule set to {}–{}", s, e);
+            }
+        }
+        "set_timelapse" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.timelapse_enabled = on;
+                log::info!("Timelapse set to {}", on);
+            }
+        }
+        "set_timelapse_schedule" => {
+            if let (Some(s), Some(e)) = (
+                cmd.get("start").and_then(|v| v.as_u64()),
+                cmd.get("end").and_then(|v| v.as_u64()),
+            ) {
+                state.timelapse_start_hour = s as u32;
+                state.timelapse_end_hour = e as u32;
+                log::info!("Timelapse schedule set to {}–{}", s, e);
+            }
+        }
+        "set_detection_record" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.detection_record_enabled = on;
+                log::info!("Detection record set to {}", on);
+            }
+        }
+        "set_detection_record_schedule" => {
+            if let (Some(s), Some(e)) = (
+                cmd.get("start").and_then(|v| v.as_u64()),
+                cmd.get("end").and_then(|v| v.as_u64()),
+            ) {
+                state.detection_record_start_hour = s as u32;
+                state.detection_record_end_hour = e as u32;
+                log::info!("Detection record schedule set to {}–{}", s, e);
+            }
+        }
         "set_detection" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
                 state.detection_enabled = on;

@@ -39,6 +39,17 @@
 	function send(type: string, value: unknown) {
 		ws?.send({ type, value });
 	}
+
+	function sendSchedule(type: string, start: number, end: number) {
+		ws?.send({ type, start, end });
+	}
+
+	function hourLabel(h: number): string {
+		if (h < 24) return `${h}:00`;
+		return `${h - 24}:00 (+1)`;
+	}
+
+	const hourOptions = Array.from({ length: 31 }, (_, i) => i);
 </script>
 
 <div class="page">
@@ -142,12 +153,78 @@
 			<!-- ── Record ────────────────────────────────── -->
 			{:else if activeTab === 'record'}
 				<section>
-					<h2>Recording</h2>
+					<h2>Regular Recording</h2>
 					<label class="row">
-						<span>Enable Recording</span>
+						<span>Enable</span>
 						<input type="checkbox" checked={appState.record_enabled}
 							onchange={(e) => send('set_record', e.currentTarget.checked)} />
 					</label>
+					<div class="row">
+						<span>Schedule</span>
+						<div class="schedule-wrap">
+							<select onchange={(e) => sendSchedule('set_record_schedule', +e.currentTarget.value, appState.record_end_hour)}>
+								{#each hourOptions as h}
+									<option value={h} selected={appState.record_start_hour === h}>{hourLabel(h)}</option>
+								{/each}
+							</select>
+							<span class="schedule-sep">–</span>
+							<select onchange={(e) => sendSchedule('set_record_schedule', appState.record_start_hour, +e.currentTarget.value)}>
+								{#each hourOptions as h}
+									<option value={h} selected={appState.record_end_hour === h}>{hourLabel(h)}</option>
+								{/each}
+							</select>
+						</div>
+					</div>
+				</section>
+
+				<section>
+					<h2>Timelapse</h2>
+					<label class="row">
+						<span>Enable</span>
+						<input type="checkbox" checked={appState.timelapse_enabled}
+							onchange={(e) => send('set_timelapse', e.currentTarget.checked)} />
+					</label>
+					<div class="row">
+						<span>Schedule</span>
+						<div class="schedule-wrap">
+							<select onchange={(e) => sendSchedule('set_timelapse_schedule', +e.currentTarget.value, appState.timelapse_end_hour)}>
+								{#each hourOptions as h}
+									<option value={h} selected={appState.timelapse_start_hour === h}>{hourLabel(h)}</option>
+								{/each}
+							</select>
+							<span class="schedule-sep">–</span>
+							<select onchange={(e) => sendSchedule('set_timelapse_schedule', appState.timelapse_start_hour, +e.currentTarget.value)}>
+								{#each hourOptions as h}
+									<option value={h} selected={appState.timelapse_end_hour === h}>{hourLabel(h)}</option>
+								{/each}
+							</select>
+						</div>
+					</div>
+				</section>
+
+				<section>
+					<h2>Detection Recording</h2>
+					<label class="row">
+						<span>Enable</span>
+						<input type="checkbox" checked={appState.detection_record_enabled}
+							onchange={(e) => send('set_detection_record', e.currentTarget.checked)} />
+					</label>
+					<div class="row">
+						<span>Schedule</span>
+						<div class="schedule-wrap">
+							<select onchange={(e) => sendSchedule('set_detection_record_schedule', +e.currentTarget.value, appState.detection_record_end_hour)}>
+								{#each hourOptions as h}
+									<option value={h} selected={appState.detection_record_start_hour === h}>{hourLabel(h)}</option>
+								{/each}
+							</select>
+							<span class="schedule-sep">–</span>
+							<select onchange={(e) => sendSchedule('set_detection_record_schedule', appState.detection_record_start_hour, +e.currentTarget.value)}>
+								{#each hourOptions as h}
+									<option value={h} selected={appState.detection_record_end_hour === h}>{hourLabel(h)}</option>
+								{/each}
+							</select>
+						</div>
+					</div>
 				</section>
 			{/if}
 
@@ -360,6 +437,35 @@
 	.select-wrap select option {
 		background: var(--input);
 		color: var(--text);
+	}
+
+	/* ── Schedule selects ───────────────────── */
+	.schedule-wrap {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
+	.schedule-wrap select {
+		appearance: none;
+		background: var(--input);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		color: var(--text);
+		font-size: 0.85rem;
+		padding: 0.35rem 0.65rem;
+		cursor: pointer;
+		transition: border-color 0.15s;
+	}
+
+	.schedule-wrap select:focus {
+		outline: none;
+		border-color: #3498db;
+	}
+
+	.schedule-sep {
+		color: var(--text3);
+		font-size: 0.85rem;
 	}
 
 	/* ── Empty / loading ────────────────────── */

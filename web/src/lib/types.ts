@@ -47,6 +47,14 @@ export interface AppState {
 	flip: [boolean, boolean];
 	fps: number;
 	record_enabled: boolean;
+	record_start_hour: number;
+	record_end_hour: number;
+	timelapse_enabled: boolean;
+	timelapse_start_hour: number;
+	timelapse_end_hour: number;
+	detection_record_enabled: boolean;
+	detection_record_start_hour: number;
+	detection_record_end_hour: number;
 	detection_enabled: boolean;
 	auto_daynight: boolean;
 	show_timestamp: boolean;

@@ -28,7 +28,7 @@ const EMA_ALPHA: f32 = 0.05; // EMA decay (time constant ≈ 20 frames)
 // Stacking
 const LUMA_PREBUF: usize = 5; // pre-detection luma frames to keep (for stack init)
 const STACK_TIMEOUT: u32 = 15; // frames after last detection before saving stack
-const SAVE_DIR: &str = "/media/mmc/detections";
+const SAVE_BASE: &str = "/media/mmc/detections";
 
 // Tuning — tracker
 const TRACK_MAX_DIST: f32 = 5.0; // max centroid distance to associate blob to track (cells)
@@ -438,6 +438,7 @@ pub fn detection_task(
     wd: WatchdogHandle,
     debug_tx: broadcast::Sender<String>,
     mask: Arc<ArcSwap<Vec<u8>>>,
+    detection_active: Arc<AtomicBool>,
 ) {
     let handle = tokio::runtime::Handle::current();
     let frame_size = IMG_WIDTH * IMG_HEIGHT;
@@ -582,7 +583,9 @@ pub fn detection_task(
 
             // Check for newly confirmed tracks and send meteor events
             let mut confirmed_ids: Vec<u32> = Vec::new();
-            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+            let now = chrono::Local::now();
+            let ts = now.format("%Y%m%d_%H%M%S").to_string();
+            let ts_dir = now.format("%Y/%m/%d/%H%M%S").to_string();
             for tr in tracks.iter_mut() {
                 if tr.confirmed {
                     confirmed_ids.push(tr.id);
@@ -635,7 +638,7 @@ pub fn detection_task(
                             );
                         }
                         stack_active = true;
-                        stack_ts = ts.clone();
+                        stack_ts = ts_dir.clone();
                         stack_countdown = STACK_TIMEOUT;
                     }
                 }
@@ -655,7 +658,7 @@ pub fn detection_task(
                     stack_countdown -= 1;
                 }
                 if stack_countdown == 0 {
-                    let path = format!("{}/{}.png", SAVE_DIR, stack_ts);
+                    let path = format!("{}/{}/stack.png", SAVE_BASE, stack_ts);
                     if let Err(e) = save_png(&stack_data, IMG_WIDTH, IMG_HEIGHT, &path) {
                         log::error!("failed to save stack: {}", e);
                     } else {
@@ -666,6 +669,10 @@ pub fn detection_task(
             }
 
             tracks.retain(|tr| tr.missed <= TRACK_MAX_MISSED);
+
+            // Signal recording task: true while any confirmed track is alive
+            let has_active = tracks.iter().any(|tr| tr.confirmed);
+            detection_active.store(has_active, Ordering::Relaxed);
 
             // Send DetectionDebug JSON
             if debug_tx.receiver_count() > 0 {

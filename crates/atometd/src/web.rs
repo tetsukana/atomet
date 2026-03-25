@@ -89,42 +89,22 @@ async fn api_get_state(
     axum::Json(serde_json::to_value(&**app).unwrap_or_default())
 }
 
-/// List files in /media/mmc/records or /media/mmc/timelapse.
-/// Query: ?dir=records  or  ?dir=timelapse
+/// List files in a media directory, walking the date-hierarchy tree.
+/// Query: ?dir=records | timelapse | detections
+/// Returns files with paths relative to the base dir (e.g. "2024/03/25/14/30.mp4").
 async fn api_list_files(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> axum::Json<serde_json::Value> {
-    let dir = match params.get("dir").map(|s| s.as_str()) {
+    let base = match params.get("dir").map(|s| s.as_str()) {
         Some("records") => "/media/mmc/records",
         Some("timelapse") => "/media/mmc/timelapse",
         Some("detections") => "/media/mmc/detections",
         _ => return axum::Json(serde_json::json!({ "files": [] })),
     };
 
+    let base_path = Path::new(base);
     let mut files: Vec<serde_json::Value> = vec![];
-
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if !meta.is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_string();
-                let size = meta.len();
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                files.push(serde_json::json!({
-                    "name": name,
-                    "size": size,
-                    "modified": modified,
-                }));
-            }
-        }
-    }
+    collect_files_recursive(base_path, base_path, &mut files);
 
     // Newest first
     files.sort_by(|a, b| {
@@ -135,6 +115,42 @@ async fn api_list_files(
     });
 
     axum::Json(serde_json::json!({ "files": files }))
+}
+
+/// Recursively collect files under `dir`, storing paths relative to `base`.
+fn collect_files_recursive(
+    base: &Path,
+    dir: &Path,
+    out: &mut Vec<serde_json::Value>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(base, &path, out);
+        } else if let Ok(meta) = entry.metadata() {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let size = meta.len();
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.push(serde_json::json!({
+                "name": rel,
+                "size": size,
+                "modified": modified,
+            }));
+        }
+    }
 }
 
 async fn api_debug_stack(

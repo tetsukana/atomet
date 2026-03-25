@@ -82,6 +82,7 @@ async fn main() {
     let wd_timelapse = supervisor.register("timelapse");
     let wd_luma = supervisor.register("luma");
     let wd_detection = supervisor.register("detection");
+    let wd_detection_record = supervisor.register("detection_record");
     // luma watch channel
     let (luma_tx, luma_rx) = watch::channel::<Option<luma::LumaFrame>>(None);
 
@@ -179,13 +180,33 @@ async fn main() {
         Arc::clone(&app_state),
     ));
 
+    // Detection active signal (for triggered recording)
+    let detection_active = Arc::new(AtomicBool::new(false));
+
+    // Detection-triggered recording task
+    let shutdown_clone = Arc::clone(&shutdown);
+    let rx_detection_record = rx_hevc.resubscribe();
+    let detection_active_clone = Arc::clone(&detection_active);
+    tokio::spawn(record::record_detection_task(
+        shutdown_clone,
+        wd_detection_record,
+        rx_detection_record,
+        detection_active_clone,
+        Arc::clone(&app_state),
+    ));
+
     // Timelapse task
     let shutdown_clone = Arc::clone(&shutdown);
     tokio::spawn(record::record_timelapse_task(
         shutdown_clone,
         wd_timelapse,
         rx_tl,
+        Arc::clone(&app_state),
     ));
+
+    // Disk cleanup task
+    let shutdown_clone = Arc::clone(&shutdown);
+    tokio::spawn(record::disk_cleanup_task(shutdown_clone));
 
     // Stream task
     log::info!("Spawning stream task");
@@ -221,6 +242,7 @@ async fn main() {
     let detection_tx_clone = detection_tx.clone();
     let luma_rx_detection = luma_rx.clone();
     let mask_clone = Arc::clone(&mask_data);
+    let detection_active_clone = Arc::clone(&detection_active);
     tokio::task::spawn_blocking(move || {
         detection::detection_task(
             luma_rx_detection,
@@ -229,6 +251,7 @@ async fn main() {
             wd_detection,
             detection_tx_clone,
             mask_clone,
+            detection_active_clone,
         );
     });
 

@@ -28,6 +28,14 @@ pub struct AppState {
 
     // --- Persisted (survives reboot) ---
     pub record_enabled: bool,
+    pub record_start_hour: u32,
+    pub record_end_hour: u32,
+    pub timelapse_enabled: bool,
+    pub timelapse_start_hour: u32,
+    pub timelapse_end_hour: u32,
+    pub detection_record_enabled: bool,
+    pub detection_record_start_hour: u32,
+    pub detection_record_end_hour: u32,
     pub detection_enabled: bool,
     pub solve_field_enabled: bool,
     pub auto_daynight: bool,
@@ -49,6 +57,14 @@ impl Default for AppState {
             analog_gain: 0,
             digital_gain: 0,
             record_enabled: false,
+            record_start_hour: 0,
+            record_end_hour: 24,
+            timelapse_enabled: false,
+            timelapse_start_hour: 0,
+            timelapse_end_hour: 24,
+            detection_record_enabled: true,
+            detection_record_start_hour: 0,
+            detection_record_end_hour: 24,
             detection_enabled: false,
             solve_field_enabled: false,
             auto_daynight: false,
@@ -61,11 +77,34 @@ impl Default for AppState {
 
 pub type SharedAppState = Arc<ArcSwap<AppState>>;
 
+/// Check if `current_hour` (0-23) falls within [start, end).
+/// `end` may exceed 23 to wrap past midnight (e.g. 30 = next-day 6:00).
+pub fn is_within_schedule(current_hour: u32, start: u32, end: u32) -> bool {
+    let h = if current_hour < start { current_hour + 24 } else { current_hour };
+    h >= start && h < end
+}
+
 /// Subset of AppState that is persisted to TOML across reboots.
 #[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct PersistConfig {
     #[serde(default)]
     pub record_enabled: bool,
+    #[serde(default)]
+    pub record_start_hour: u32,
+    #[serde(default = "default_24")]
+    pub record_end_hour: u32,
+    #[serde(default)]
+    pub timelapse_enabled: bool,
+    #[serde(default)]
+    pub timelapse_start_hour: u32,
+    #[serde(default = "default_24")]
+    pub timelapse_end_hour: u32,
+    #[serde(default = "default_true")]
+    pub detection_record_enabled: bool,
+    #[serde(default)]
+    pub detection_record_start_hour: u32,
+    #[serde(default = "default_24")]
+    pub detection_record_end_hour: u32,
     #[serde(default)]
     pub detection_enabled: bool,
     #[serde(default)]
@@ -76,10 +115,26 @@ pub struct PersistConfig {
     pub timestamp_position: u32,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_24() -> u32 {
+    24
+}
+
 impl From<&AppState> for PersistConfig {
     fn from(s: &AppState) -> Self {
         Self {
             record_enabled: s.record_enabled,
+            record_start_hour: s.record_start_hour,
+            record_end_hour: s.record_end_hour,
+            timelapse_enabled: s.timelapse_enabled,
+            timelapse_start_hour: s.timelapse_start_hour,
+            timelapse_end_hour: s.timelapse_end_hour,
+            detection_record_enabled: s.detection_record_enabled,
+            detection_record_start_hour: s.detection_record_start_hour,
+            detection_record_end_hour: s.detection_record_end_hour,
             detection_enabled: s.detection_enabled,
             solve_field_enabled: s.solve_field_enabled,
             auto_daynight: s.auto_daynight,
@@ -92,6 +147,14 @@ impl AppState {
     pub fn with_config(cfg: PersistConfig) -> Self {
         AppState {
             record_enabled: cfg.record_enabled,
+            record_start_hour: cfg.record_start_hour,
+            record_end_hour: cfg.record_end_hour,
+            timelapse_enabled: cfg.timelapse_enabled,
+            timelapse_start_hour: cfg.timelapse_start_hour,
+            timelapse_end_hour: cfg.timelapse_end_hour,
+            detection_record_enabled: cfg.detection_record_enabled,
+            detection_record_start_hour: cfg.detection_record_start_hour,
+            detection_record_end_hour: cfg.detection_record_end_hour,
             detection_enabled: cfg.detection_enabled,
             solve_field_enabled: cfg.solve_field_enabled,
             auto_daynight: cfg.auto_daynight,
