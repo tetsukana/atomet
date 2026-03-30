@@ -181,18 +181,21 @@ async fn main() {
         Arc::clone(&app_state),
     ));
 
-    // Detection active signal (for triggered recording)
+    // Detection signals (for triggered recording)
     let detection_active = Arc::new(AtomicBool::new(false));
+    let detection_tracking = Arc::new(AtomicBool::new(false));
 
     // Detection-triggered recording task
     let shutdown_clone = Arc::clone(&shutdown);
     let rx_detection_record = rx_hevc.resubscribe();
     let detection_active_clone = Arc::clone(&detection_active);
+    let detection_tracking_clone = Arc::clone(&detection_tracking);
     tokio::spawn(record::record_detection_task(
         shutdown_clone,
         wd_detection_record,
         rx_detection_record,
         detection_active_clone,
+        detection_tracking_clone,
         Arc::clone(&app_state),
     ));
 
@@ -244,6 +247,7 @@ async fn main() {
     let luma_rx_detection = luma_rx.clone();
     let mask_clone = Arc::clone(&mask_data);
     let detection_active_clone = Arc::clone(&detection_active);
+    let detection_tracking_clone = Arc::clone(&detection_tracking);
     tokio::task::spawn_blocking(move || {
         detection::detection_task(
             luma_rx_detection,
@@ -253,6 +257,7 @@ async fn main() {
             detection_tx_clone,
             mask_clone,
             detection_active_clone,
+            detection_tracking_clone,
         );
     });
 

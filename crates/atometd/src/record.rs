@@ -109,30 +109,28 @@ pub async fn record_regular_task(
 
 /// Detection-triggered recording task.
 ///
-/// Maintains a rolling buffer of the last completed GOP (~2s).  When
-/// `detection_active` becomes true the buffered GOP is flushed to a
-/// new MP4 file and subsequent frames are written in real-time.  When
-/// the flag goes back to false, recording continues until the current
-/// GOP ends (next IDR), then the file is finalized.
+/// Maintains the current GOP as a pre-buffer.  The buffer only resets
+/// on IDR boundaries when no track is active and we are not recording.
+/// This ensures the meteor start frame is always captured: tracking
+/// begins before confirmation, and the pre-buffer spans the full
+/// tracking period.  When `detection_active` becomes true, the buffer
+/// is flushed to a new MP4 and subsequent frames are written live.
 pub async fn record_detection_task(
     shutdown: Arc<AtomicBool>,
     wd: WatchdogHandle,
     mut rx: broadcast::Receiver<Arc<VideoFrame>>,
     detection_active: Arc<AtomicBool>,
+    detection_tracking: Arc<AtomicBool>,
     app_state: SharedAppState,
 ) {
-    use std::collections::VecDeque;
-
     log::info!("record_detection_task started");
 
-    // GOP ring buffer: keeps the last 1 completed GOP (~2s pre-buffer)
-    let mut gop_ring: VecDeque<Vec<Arc<VideoFrame>>> = VecDeque::new();
-    let mut current_gop: Vec<Arc<VideoFrame>> = Vec::new();
+    // Pre-buffer: accumulates frames from current GOP onward.
+    // Only cleared on IDR when not tracking and not recording.
+    let mut prebuf: Vec<Arc<VideoFrame>> = Vec::new();
 
     let mut current_muxer: Option<Mp4Muxer<BufWriter<File>>> = None;
-    // true while we are actively writing to the muxer
     let mut recording = false;
-    // true = we saw detection_active go false, waiting for next IDR to stop
     let mut tailing = false;
 
     let mut wd_timer = interval(Duration::from_secs(1));
@@ -145,26 +143,26 @@ pub async fn record_detection_task(
                         || pack.nal_type == IMPEncoderH265NaluType_IMP_H265_NAL_SLICE_IDR_N_LP
                 });
 
+                let tracking = detection_tracking.load(Ordering::Relaxed);
+
                 let now = Local::now();
                 let state = app_state.load();
                 let det = state.detection_record_enabled
                     && is_within_schedule(now.hour(), state.detection_record_start_hour, state.detection_record_end_hour)
                     && detection_active.load(Ordering::Relaxed);
 
-                // --- GOP ring buffer maintenance ---
-                if has_idr {
-                    if !current_gop.is_empty() {
-                        gop_ring.push_back(std::mem::take(&mut current_gop));
-                        while gop_ring.len() > 1 {
-                            gop_ring.pop_front();
-                        }
-                    }
+                // --- Pre-buffer maintenance ---
+                // Only reset on IDR when idle (no tracking, no recording)
+                if has_idr && !tracking && !recording {
+                    prebuf.clear();
                 }
-                current_gop.push(Arc::clone(&frame));
+                if !recording {
+                    prebuf.push(Arc::clone(&frame));
+                }
 
-                // --- state transitions ---
+                // --- State transitions ---
                 if !recording && det {
-                    // Detection just fired — open a new file and flush buffer
+                    // Detection confirmed — open file and flush pre-buffer
                     let now = Local::now();
                     let dir = format!("/media/mmc/detections/{}", now.format("%Y/%m/%d/%H%M%S"));
                     let path = format!("{}/video.mp4", dir);
@@ -180,17 +178,8 @@ pub async fn record_detection_task(
                             let writer = BufWriter::new(file);
                             match Mp4Muxer::new(writer, 1920, 1080, 90000).await {
                                 Ok(mut muxer) => {
-                                    // Flush buffered GOPs
-                                    for gop in gop_ring.drain(..) {
-                                        for f in &gop {
-                                            if let Err(e) = write_frame_to_muxer(&mut muxer, f).await {
-                                                log::error!("Failed to write buffered frame: {}", e);
-                                            }
-                                        }
-                                    }
-                                    // Flush frames in current_gop (accumulated before this IDR or since last IDR)
-                                    for f in &current_gop {
-                                        if let Err(e) = write_frame_to_muxer(&mut muxer, f).await {
+                                    for f in prebuf.drain(..) {
+                                        if let Err(e) = write_frame_to_muxer(&mut muxer, &f).await {
                                             log::error!("Failed to write buffered frame: {}", e);
                                         }
                                     }
@@ -204,7 +193,6 @@ pub async fn record_detection_task(
                         Err(e) => log::error!("Failed to create detection file '{}': {}", path, e),
                     }
                 } else if recording {
-                    // Write current frame
                     if let Some(muxer) = current_muxer.as_mut() {
                         if let Err(e) = write_frame_to_muxer(muxer, &frame).await {
                             log::error!("Failed to write video frame: {}", e);
@@ -212,14 +200,11 @@ pub async fn record_detection_task(
                     }
 
                     if det {
-                        // Detection still active — reset tail
                         tailing = false;
                     } else if !tailing {
-                        // Detection just went inactive — start tailing
                         tailing = true;
                     }
 
-                    // If tailing and we hit an IDR, this GOP boundary is our stop point
                     if tailing && has_idr {
                         if let Some(muxer) = current_muxer.take() {
                             if let Err(e) = muxer.finish().await {
@@ -239,7 +224,6 @@ pub async fn record_detection_task(
         }
     }
 
-    // Shutdown: finalize any open file
     if let Some(muxer) = current_muxer.take() {
         if let Err(e) = muxer.finish().await {
             log::error!("Failed to finish detection muxer on shutdown: {}", e);

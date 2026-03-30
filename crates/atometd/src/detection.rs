@@ -439,6 +439,7 @@ pub fn detection_task(
     debug_tx: broadcast::Sender<String>,
     mask: Arc<ArcSwap<Vec<u8>>>,
     detection_active: Arc<AtomicBool>,
+    detection_tracking: Arc<AtomicBool>,
 ) {
     let handle = tokio::runtime::Handle::current();
     let frame_size = IMG_WIDTH * IMG_HEIGHT;
@@ -675,7 +676,8 @@ pub fn detection_task(
 
             tracks.retain(|tr| tr.missed <= TRACK_MAX_MISSED);
 
-            // Signal recording task: true while any confirmed track is alive
+            // Signal recording task
+            detection_tracking.store(!tracks.is_empty(), Ordering::Relaxed);
             let has_active = tracks.iter().any(|tr| tr.confirmed);
             detection_active.store(has_active, Ordering::Relaxed);
 

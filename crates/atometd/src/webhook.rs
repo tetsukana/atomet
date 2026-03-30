@@ -16,15 +16,14 @@ fn hostname() -> &'static str {
     static HOST: OnceLock<String> = OnceLock::new();
     HOST.get_or_init(|| {
         let mut buf = [0u8; 64];
-        let name = unsafe {
+        unsafe {
             if libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) == 0 {
                 let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
                 std::str::from_utf8(&buf[..len]).unwrap_or("atomet").to_string()
             } else {
                 "atomet".to_string()
             }
-        };
-        name
+        }
     })
 }
 
@@ -44,6 +43,15 @@ fn make_agent() -> ureq::Agent {
     config.new_agent()
 }
 
+/// Buffered meteor info, accumulated between `meteor` and `meteor_stack`.
+struct MeteorInfo {
+    id: u64,
+    speed: f64,
+    frames: u64,
+    ts: String,
+    raw_json: String,
+}
+
 /// Async task that listens for meteor events on `detection_rx` and
 /// system events on `event_rx`, sending webhook notifications to all
 /// configured endpoints.
@@ -55,13 +63,26 @@ pub async fn webhook_task(
 ) {
     log::info!("webhook_task started");
 
+    // Buffer meteor events until the stack image is ready
+    let mut pending_meteors: Vec<MeteorInfo> = Vec::new();
+
     while !shutdown.load(Ordering::Relaxed) {
         tokio::select! {
             Ok(json) = detection_rx.recv() => {
                 if json.contains(r#""type":"meteor""#) {
-                    handle_meteor(&app_state, json);
+                    // Buffer meteor info — will be sent with the stack image
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                        pending_meteors.push(MeteorInfo {
+                            id: v["id"].as_u64().unwrap_or(0),
+                            speed: v["speed"].as_f64().unwrap_or(0.0),
+                            frames: v["frames"].as_u64().unwrap_or(0),
+                            ts: v["ts"].as_str().unwrap_or("unknown").to_string(),
+                            raw_json: json,
+                        });
+                    }
                 } else if json.contains(r#""type":"meteor_stack""#) {
-                    handle_meteor_stack(&app_state, json);
+                    let meteors = std::mem::take(&mut pending_meteors);
+                    handle_meteor_stack(&app_state, json, meteors);
                 }
             }
             Some(event) = event_rx.recv() => {
@@ -83,47 +104,14 @@ fn has_any_url(app_state: &SharedAppState) -> (String, String, String) {
     )
 }
 
-fn handle_meteor(app_state: &SharedAppState, json: String) {
+/// Combined notification: meteor info + stack image in one message.
+fn handle_meteor_stack(app_state: &SharedAppState, stack_json: String, meteors: Vec<MeteorInfo>) {
     let (discord_url, slack_url, generic_url) = has_any_url(app_state);
     if discord_url.is_empty() && slack_url.is_empty() && generic_url.is_empty() {
         return;
     }
 
-    let meteor: serde_json::Value = match serde_json::from_str(&json) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let id = meteor["id"].as_u64().unwrap_or(0);
-    let speed = meteor["speed"].as_f64().unwrap_or(0.0);
-    let frames = meteor["frames"].as_u64().unwrap_or(0);
-    let ts = meteor["ts"].as_str().unwrap_or("unknown").to_string();
-
-    tokio::task::spawn_blocking(move || {
-        let agent = make_agent();
-        if !discord_url.is_empty() {
-            let body = format_meteor_discord(id, speed, frames, &ts);
-            send_json(&agent, &discord_url, &body);
-        }
-        if !slack_url.is_empty() {
-            let text = format_meteor_slack(id, speed, frames, &ts);
-            send_json(&agent, &slack_url, &serde_json::json!({ "text": text }));
-        }
-        if !generic_url.is_empty() {
-            post_json(&agent, &generic_url, &json).ok();
-        }
-    });
-}
-
-/// Called when the detection stack PNG has been saved.
-/// Sends the image to Discord (multipart), Slack (text-only), and Generic (base64).
-fn handle_meteor_stack(app_state: &SharedAppState, json: String) {
-    let (discord_url, slack_url, generic_url) = has_any_url(app_state);
-    if discord_url.is_empty() && slack_url.is_empty() && generic_url.is_empty() {
-        return;
-    }
-
-    let msg: serde_json::Value = match serde_json::from_str(&json) {
+    let msg: serde_json::Value = match serde_json::from_str(&stack_json) {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -139,12 +127,23 @@ fn handle_meteor_stack(app_state: &SharedAppState, json: String) {
         let agent = make_agent();
 
         if !discord_url.is_empty() {
-            send_discord_image(&agent, &discord_url, &path, &ts);
+            send_discord_meteor(&agent, &discord_url, &path, &ts, &meteors);
+        }
+        if !slack_url.is_empty() {
+            let text = if meteors.is_empty() {
+                format!("*Meteor Detected* | {}", ts)
+            } else {
+                meteors
+                    .iter()
+                    .map(|m| format_meteor_slack(m.id, m.speed, m.frames, &m.ts))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            send_json(&agent, &slack_url, &serde_json::json!({ "text": text }));
         }
         if !generic_url.is_empty() {
-            send_generic_image(&agent, &generic_url, &path, &ts);
+            send_generic_meteor(&agent, &generic_url, &path, &ts, &meteors);
         }
-        // Slack incoming webhooks don't support file uploads
     });
 }
 
@@ -209,22 +208,6 @@ fn handle_event(app_state: &SharedAppState, event: WebhookEvent) {
 
 // ── Formatters ──────────────────────────────────────────────
 
-fn format_meteor_discord(id: u64, speed: f64, frames: u64, ts: &str) -> serde_json::Value {
-    serde_json::json!({
-        "username": hostname(),
-        "embeds": [{
-            "title": "Meteor Detected",
-            "color": 3447003,
-            "fields": [
-                { "name": "ID",     "value": id.to_string(),              "inline": true },
-                { "name": "Speed",  "value": format!("{:.1} px/f", speed), "inline": true },
-                { "name": "Frames", "value": frames.to_string(),          "inline": true },
-            ],
-            "footer": { "text": format!("atomet | {}", ts) },
-        }]
-    })
-}
-
 fn format_meteor_slack(id: u64, speed: f64, frames: u64, ts: &str) -> String {
     format!(
         "*Meteor Detected*\nID: {} | Speed: {:.1} px/f | Frames: {} | {}",
@@ -249,23 +232,42 @@ fn send_json(agent: &ureq::Agent, url: &str, body: &serde_json::Value) {
     }
 }
 
-/// Send an image to Discord via multipart/form-data with an embed.
-/// Manually constructs the multipart body to avoid getrandom dependency.
-fn send_discord_image(agent: &ureq::Agent, url: &str, path: &str, ts: &str) {
+/// Discord: multipart with embed (meteor fields + image) in one message.
+fn send_discord_meteor(
+    agent: &ureq::Agent,
+    url: &str,
+    image_path: &str,
+    ts: &str,
+    meteors: &[MeteorInfo],
+) {
+    let fields: Vec<serde_json::Value> = meteors
+        .iter()
+        .flat_map(|m| {
+            vec![
+                serde_json::json!({ "name": "ID",     "value": m.id.to_string(),                "inline": true }),
+                serde_json::json!({ "name": "Speed",  "value": format!("{:.1} px/f", m.speed),   "inline": true }),
+                serde_json::json!({ "name": "Frames", "value": m.frames.to_string(),             "inline": true }),
+            ]
+        })
+        .collect();
+
     let payload = serde_json::json!({
         "username": hostname(),
         "embeds": [{
-            "title": "Detection Stack",
+            "title": "Meteor Detected",
             "color": 3447003,
+            "fields": fields,
             "image": { "url": "attachment://stack.png" },
             "footer": { "text": format!("atomet | {}", ts) },
         }]
     });
 
-    let image_data = match std::fs::read(path) {
+    let image_data = match std::fs::read(image_path) {
         Ok(d) => d,
         Err(e) => {
-            log::error!("Failed to read stack image '{}': {}", path, e);
+            log::error!("Failed to read stack image '{}': {}", image_path, e);
+            // Fall back to JSON-only (no image)
+            send_json(agent, url, &payload);
             return;
         }
     };
@@ -274,19 +276,16 @@ fn send_discord_image(agent: &ureq::Agent, url: &str, path: &str, ts: &str) {
     let payload_str = payload.to_string();
 
     let mut body: Vec<u8> = Vec::new();
-    // payload_json part
     body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     body.extend_from_slice(b"Content-Disposition: form-data; name=\"payload_json\"\r\n");
     body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
     body.extend_from_slice(payload_str.as_bytes());
     body.extend_from_slice(b"\r\n");
-    // file part
     body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     body.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"stack.png\"\r\n");
     body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
     body.extend_from_slice(&image_data);
     body.extend_from_slice(b"\r\n");
-    // closing boundary
     body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
     let content_type = format!("multipart/form-data; boundary={}", boundary);
@@ -296,30 +295,42 @@ fn send_discord_image(agent: &ureq::Agent, url: &str, path: &str, ts: &str) {
         .header("Content-Type", &content_type)
         .send(&body[..])
     {
-        Ok(_) => log::info!("Discord image webhook sent"),
-        Err(e) => log::error!("Discord image webhook failed: {}", e),
+        Ok(_) => log::info!("Discord meteor webhook sent"),
+        Err(e) => log::error!("Discord meteor webhook failed: {}", e),
     }
 }
 
-/// Send an image to Generic webhook as base64-encoded JSON.
-fn send_generic_image(agent: &ureq::Agent, url: &str, path: &str, ts: &str) {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            log::error!("Failed to read stack image '{}': {}", path, e);
-            return;
+/// Generic: meteor JSON + base64 image in one payload.
+fn send_generic_meteor(
+    agent: &ureq::Agent,
+    url: &str,
+    image_path: &str,
+    ts: &str,
+    meteors: &[MeteorInfo],
+) {
+    let image_b64 = match std::fs::read(image_path) {
+        Ok(data) => {
+            use base64ct::{Base64, Encoding};
+            Some(Base64::encode_string(&data))
         }
+        Err(_) => None,
     };
 
-    use base64ct::{Base64, Encoding};
-    let b64 = Base64::encode_string(&data);
+    let meteor_vals: Vec<serde_json::Value> = meteors
+        .iter()
+        .filter_map(|m| serde_json::from_str(&m.raw_json).ok())
+        .collect();
 
-    let body = serde_json::json!({
-        "type": "meteor_stack",
+    let mut body = serde_json::json!({
+        "type": "meteor_detection",
         "ts": ts,
-        "image": b64,
-        "image_type": "image/png",
+        "meteors": meteor_vals,
     });
+
+    if let Some(b64) = image_b64 {
+        body["image"] = serde_json::json!(b64);
+        body["image_type"] = serde_json::json!("image/png");
+    }
 
     send_json(agent, url, &body);
 }
