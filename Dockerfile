@@ -56,7 +56,7 @@ COPY buildscripts/docker_build.sh /usr/local/bin/docker_build
 COPY buildscripts/rust_build.sh /usr/local/bin/rust_build
 COPY buildscripts/imgproc_build.sh /usr/local/bin/imgproc_build
 COPY buildscripts/web_build.sh /usr/local/bin/web_build
-COPY buildscripts/isp_build.sh /usr/local/bin/isp_build
-RUN chmod +x /usr/local/bin/docker_build /usr/local/bin/rust_build /usr/local/bin/imgproc_build /usr/local/bin/web_build /usr/local/bin/isp_build
+COPY buildscripts/drivers_build.sh /usr/local/bin/drivers_build
+RUN chmod +x /usr/local/bin/docker_build /usr/local/bin/rust_build /usr/local/bin/imgproc_build /usr/local/bin/web_build /usr/local/bin/drivers_build
 
 CMD ["/usr/local/bin/docker_build"]
