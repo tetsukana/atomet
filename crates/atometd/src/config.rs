@@ -90,10 +90,14 @@ impl Default for AppState {
 pub type SharedAppState = Arc<ArcSwap<AppState>>;
 
 /// Check if `current_hour` (0-23) falls within [start, end).
-/// `end` may exceed 23 to wrap past midnight (e.g. 30 = next-day 6:00).
+/// Supports wrap-around: start=20, end=6 means 20:00–06:00 next day.
 pub fn is_within_schedule(current_hour: u32, start: u32, end: u32) -> bool {
-    let h = if current_hour < start { current_hour + 24 } else { current_hour };
-    h >= start && h < end
+    if start <= end {
+        current_hour >= start && current_hour < end
+    } else {
+        // Wrap-around: e.g. start=20, end=6 → 20..24 or 0..6
+        current_hour >= start || current_hour < end
+    }
 }
 
 /// Subset of AppState that is persisted to TOML across reboots.
