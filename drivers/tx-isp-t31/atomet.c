@@ -18,8 +18,6 @@
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
 
 #include "atomet.h"
 
@@ -105,6 +103,39 @@ static int atomet_set_day_night(unsigned long arg)
     return 0;
 }
 
+/* ---- ISP digital gain cap ---- */
+
+static int atomet_set_max_idg(unsigned long arg)
+{
+    uint32_t val;
+
+    if (copy_from_user(&val, (void __user *)arg, sizeof(val)))
+        return -EFAULT;
+
+    tisp_ae_ctrls.max_idg = val;
+    return 0;
+}
+
+/* ---- Freeze / Unfreeze AE ---- */
+
+static int atomet_freeze_ae(void)
+{
+    tisp_ae_ctrls.ae_mode = 1;
+    tisp_ae_ctrls.it_manual_en = 1;
+    tisp_ae_ctrls.ag_manual_en = 1;
+    tisp_ae_ctrls.dg_manual_en = 1;
+    return 0;
+}
+
+static int atomet_unfreeze_ae(void)
+{
+    tisp_ae_ctrls.ae_mode = 0;
+    tisp_ae_ctrls.it_manual_en = 0;
+    tisp_ae_ctrls.ag_manual_en = 0;
+    tisp_ae_ctrls.dg_manual_en = 0;
+    return 0;
+}
+
 /* ---- ioctl dispatch ---- */
 
 static long atomet_ioctl(struct file *filp, unsigned int cmd,
@@ -121,6 +152,12 @@ static long atomet_ioctl(struct file *filp, unsigned int cmd,
         return atomet_set_bypass(arg);
     case ATOMET_SET_DAY_NIGHT:
         return atomet_set_day_night(arg);
+    case ATOMET_FREEZE_AE:
+        return atomet_freeze_ae();
+    case ATOMET_UNFREEZE_AE:
+        return atomet_unfreeze_ae();
+    case ATOMET_SET_MAX_IDG:
+        return atomet_set_max_idg(arg);
     default:
         return -ENOTTY;
     }
@@ -151,92 +188,6 @@ static struct miscdevice atomet_dev = {
     .fops  = &atomet_fops,
 };
 
-static char *ntok(char *p, char **e)
-{
-    while (*p==' '||*p=='\t') p++;
-    if (*p=='\0'||*p=='\n') return NULL;
-    *e = p;
-    while (**e&&**e!=' '&&**e!='\t'&&**e!='\n') (*e)++;
-    return p;
-}
-
-static int pu(const char *s, int l, unsigned int *o)
-{
-    unsigned int v=0; int i;
-    if (l>=2&&s[0]=='0'&&(s[1]=='x'||s[1]=='X')) {
-        for(i=2;i<l;i++){char c=s[i];
-            if(c>='0'&&c<='9')v=v*16+(c-'0');
-            else if(c>='a'&&c<='f')v=v*16+(c-'a'+10);
-            else if(c>='A'&&c<='F')v=v*16+(c-'A'+10);
-            else return -1;}
-    } else { for(i=0;i<l;i++){if(s[i]<'0'||s[i]>'9')return -1;v=v*10+(s[i]-'0');} }
-    *o=v; return 0;
-}
-
-static int ae_show(struct seq_file *m, void *v)
-{
-    seq_printf(m, "Hello World!\n");
-    return 0;
-}
-
-
-static int ae_open(struct inode *i, struct file *f)
-{ return single_open(f, ae_show, NULL); }
-
-static ssize_t ae_wr(struct file *f, const char __user *buf,
-                     size_t cnt, loff_t *pos)
-{
-    char b[256]; int l; char *p;
-
-    /* Text commands */
-    if(cnt>=sizeof(b))cnt=sizeof(b)-1;
-    if(copy_from_user(b,buf,cnt))return -EFAULT;
-    b[cnt]=0; l=strlen(b); if(l>0&&b[l-1]=='\n')b[--l]=0;
-    p=b;
-
-    /* freeze */
-    if(strncmp(p,"freeze",6)==0 && (p[6]==0||p[6]==' ')) {
-        tisp_ae_ctrls.ae_mode = 1;
-        tisp_ae_ctrls.it_manual_en = 1;
-        tisp_ae_ctrls.ag_manual_en = 1; 
-        tisp_ae_ctrls.dg_manual_en = 1;
-        return cnt;
-    }
-
-    /* unfreeze */
-    if(strncmp(p,"unfreeze",8)==0) {
-        tisp_ae_ctrls.ae_mode=0;
-        tisp_ae_ctrls.it_manual_en=0;
-        tisp_ae_ctrls.ag_manual_en=0;
-        tisp_ae_ctrls.dg_manual_en=0;
-        return cnt;
-    }
-
-    /* set <it> <ag> <dg> */
-    if(strncmp(p,"set ",4)==0) {
-        unsigned int a,b2,c; char*t1,*e1,*t2,*e2,*t3,*e3;
-        p+=4; t1=ntok(p,&e1);t2=ntok(e1,&e2);t3=ntok(e2,&e3);
-        if(!t1||!t2||!t3)return cnt;
-        if(pu(t1,e1-t1,&a)||pu(t2,e2-t2,&b2)||pu(t3,e3-t3,&c))return cnt;
-        tisp_ae_ctrls.ae_mode = 1;
-        tisp_ae_ctrls.it_value = a;
-        tisp_ae_ctrls.ag_value = b2;
-        tisp_ae_ctrls.idg_value = c;
-        tisp_ae_ctrls.it_manual_en = 1;
-        tisp_ae_ctrls.ag_manual_en = 1; 
-        tisp_ae_ctrls.dg_manual_en = 1;
-        return cnt;
-    }
-
-    return cnt;
-}
-
-
-static const struct file_operations fops = {
-    .owner=THIS_MODULE,.open=ae_open,.read=seq_read,
-    .write=ae_wr,.llseek=seq_lseek,.release=single_release,
-};
-
 /* ---- init/exit ---- */
 
 int atomet_init(void)
@@ -249,8 +200,6 @@ int atomet_init(void)
         return ret;
     }
 
-    if (!proc_create("ae_ctrl", 0666, NULL, &fops)) return -ENOMEM;
-    
     printk(KERN_INFO "atomet: /dev/atomet ready\n");
     printk(KERN_INFO "  ae_ctrls   @ %px\n", &tisp_ae_ctrls);
     printk(KERN_INFO "  tp_night   @ %px\n", tparams_night);

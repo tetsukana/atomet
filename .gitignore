@@ -15,7 +15,10 @@ web/build/
 *.mod.c
 *.mod.o
 *.cmd
-tx-isp-t31/Module.symvers
-tx-isp-t31/modules.order
-tx-isp-t31/.tmp_versions/
+drivers/tx-isp-t31/Module.symvers
+drivers/tx-isp-t31/modules.order
+drivers/tx-isp-t31/.tmp_versions/
+drivers/sensors-t31/gc2053/Module.symvers
+drivers/sensors-t31/gc2053/modules.order
+drivers/sensors-t31/gc2053/.tmp_versions/
 *.log

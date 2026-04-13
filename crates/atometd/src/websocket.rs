@@ -84,16 +84,31 @@ async fn handle_command(
             return Some(ioctl_set_ae_enable(enable));
         }
         "set_exposure_us" => {
-            let it = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(1346) as u32;
-            return Some(ioctl_set_ae_it(it));
+            let us = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(40000) as u32;
+            let lines = crate::ae_ctrl::us_to_lines(us);
+            return Some(ioctl_set_ae_it(lines));
         }
         "set_analog_gain" => {
-            let ag = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(1024) as u32;
-            return Some(ioctl_set_ae_ag(ag));
+            let db10 = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let isp_gain = crate::ae_ctrl::db10_to_isp_gain(db10);
+            return Some(ioctl_set_ae_ag(isp_gain));
         }
         "set_digital_gain" => {
-            let dg = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(1346) as u32;
-            return Some(ioctl_set_ae_dg(dg));
+            let db10 = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let isp_gain = crate::ae_ctrl::db10_to_isp_gain(db10);
+            return Some(ioctl_set_ae_dg(isp_gain));
+        }
+        "set_max_digital_gain" => {
+            let db10 = cmd.get("value").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let isp_gain = crate::ae_ctrl::db10_to_isp_gain(db10);
+            let resp = match crate::ae_ctrl::AtometDev::open() {
+                Ok(dev) => match dev.set_max_idg(isp_gain) {
+                    Ok(()) => serde_json::json!({ "type": "max_idg", "db10": db10 }),
+                    Err(e) => serde_json::json!({ "type": "error", "msg": format!("{}", e) }),
+                },
+                Err(e) => serde_json::json!({ "type": "error", "msg": format!("{}", e) }),
+            };
+            return Some(resp.to_string());
         }
         "debug_ioctl" => {
             return Some(ioctl_debug_numbers());
@@ -343,26 +358,22 @@ fn ioctl_set_bypass(bits: Option<&Vec<serde_json::Value>>) -> String {
 
 fn ioctl_set_ae_enable(ae_enable: bool) -> String {
     let resp = match crate::ae_ctrl::AtometDev::open() {
-        Ok(dev) => match dev.get_ae() {
-            Ok(mut ae) => {
-                let v = if ae_enable { 0 } else { 1 };
-                ae.ae_mode = v;
-                ae.it_manual_en = v;
-                ae.ag_manual_en = v;
-                ae.dg_manual_en = v;
-                match dev.set_ae(&ae) {
-                    Ok(()) => {
-                        serde_json::json!({ "type": "ae_mode", "mode": v })
-                    }
-                    Err(e) => {
-                        serde_json::json!({ "type": "error", "msg": format!("set_ae: {}", e) })
-                    }
+        Ok(dev) => {
+            let result = if ae_enable {
+                dev.unfreeze_ae()
+            } else {
+                dev.freeze_ae()
+            };
+            match result {
+                Ok(()) => {
+                    let mode = if ae_enable { 0 } else { 1 };
+                    serde_json::json!({ "type": "ae_mode", "mode": mode })
+                }
+                Err(e) => {
+                    serde_json::json!({ "type": "error", "msg": format!("freeze/unfreeze: {}", e) })
                 }
             }
-            Err(e) => {
-                serde_json::json!({ "type": "error", "msg": format!("get_ae: {}", e) })
-            }
-        },
+        }
         Err(e) => serde_json::json!({ "type": "error", "msg": format!("open /dev/atomet: {}", e) }),
     };
     resp.to_string()
@@ -373,6 +384,8 @@ fn ioctl_set_ae_it(it: u32) -> String {
         Ok(dev) => match dev.get_ae() {
             Ok(mut ae) => {
                 ae.it_value = it;
+                ae.it_manual_en = 1;
+                ae.ae_mode = 1;
                 match dev.set_ae(&ae) {
                     Ok(()) => {
                         serde_json::json!({ "type": "it", "value": it })
@@ -396,6 +409,8 @@ fn ioctl_set_ae_ag(ag: u32) -> String {
         Ok(dev) => match dev.get_ae() {
             Ok(mut ae) => {
                 ae.ag_value = ag;
+                ae.ag_manual_en = 1;
+                ae.ae_mode = 1;
                 match dev.set_ae(&ae) {
                     Ok(()) => {
                         serde_json::json!({ "type": "ag", "value": ag })
@@ -419,6 +434,8 @@ fn ioctl_set_ae_dg(dg: u32) -> String {
         Ok(dev) => match dev.get_ae() {
             Ok(mut ae) => {
                 ae.idg_value = dg;
+                ae.dg_manual_en = 1;
+                ae.ae_mode = 1;
                 match dev.set_ae(&ae) {
                     Ok(()) => {
                         serde_json::json!({ "type": "dg", "value": dg })
@@ -438,30 +455,26 @@ fn ioctl_set_ae_dg(dg: u32) -> String {
 }
 
 fn ioctl_get_ae() -> String {
+    use crate::ae_ctrl::{lines_to_us, isp_gain_to_db10};
     let resp = match crate::ae_ctrl::AtometDev::open() {
         Ok(dev) => match dev.get_ae() {
             Ok(ae) => serde_json::json!({
                 "type": "ae_attr",
                 "ae_mode": ae.ae_mode,
-                "ag_value": ae.ag_value,
-                "sdg_value": ae.sdg_value,
+                "exposure_us": lines_to_us(ae.it_value),
+                "analog_gain_db10": isp_gain_to_db10(ae.ag_value),
+                "digital_gain_db10": isp_gain_to_db10(ae.idg_value),
                 "it_value": ae.it_value,
+                "ag_value": ae.ag_value,
                 "idg_value": ae.idg_value,
-                "max_ag": ae.max_ag,
-                "max_sdg": ae.max_sdg,
                 "max_it": ae.max_it,
-                "max_idg": ae.max_idg,
+                "max_it_us": lines_to_us(ae.max_it),
+                "max_ag_db10": isp_gain_to_db10(ae.max_ag),
+                "max_idg_db10": isp_gain_to_db10(ae.max_idg),
                 "total_ev": ae.total_ev,
-                "total_gain_log2": ae.total_gain_log2,
-                "again_log2": ae.again_log2,
                 "it_manual_en": ae.it_manual_en,
                 "ag_manual_en": ae.ag_manual_en,
                 "dg_manual_en": ae.dg_manual_en,
-                "min_ag": ae.min_ag,
-                "min_sdg": ae.min_sdg,
-                "min_it": ae.min_it,
-                "min_idg": ae.min_idg,
-                "sdg_en": ae.sdg_en,
             }),
             Err(e) => serde_json::json!({ "type": "error", "msg": format!("get_ae: {}", e) }),
         },

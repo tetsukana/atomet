@@ -3,7 +3,6 @@
 //! Mirrors atomet.h ioctl definitions. All operations are
 //! simple file open + ioctl, no dependencies beyond libc.
 
-use isvp_sys::*;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -29,6 +28,13 @@ const ATOMET_SET_AE_ATTR: u32 = ioc_write(1, std::mem::size_of::<AeParams>() as 
 const ATOMET_GET_TOP_BYPASS: u32 = ioc_read(2, std::mem::size_of::<TopBypass>() as u32);
 const ATOMET_SET_TOP_BYPASS: u32 = ioc_write(3, std::mem::size_of::<TopBypass>() as u32);
 const ATOMET_SET_DAY_NIGHT: u32 = ioc_write(4, std::mem::size_of::<i32>() as u32);
+// _IO on MIPS: dir=1 (IOC_NONE), size=0
+const fn ioc_none(nr: u32) -> u32 {
+    (1 << 29) | (IOC_MAGIC << 8) | nr
+}
+const ATOMET_FREEZE_AE: u32 = ioc_none(5);
+const ATOMET_UNFREEZE_AE: u32 = ioc_none(6);
+const ATOMET_SET_MAX_IDG: u32 = ioc_write(7, std::mem::size_of::<u32>() as u32);
 
 /// tisp_ae_ctrls — 152 bytes, matches atomet.h struct ae_params
 #[repr(C)]
@@ -80,6 +86,31 @@ pub struct AeParams {
 pub struct TopBypass {
     pub bits: [u32; 32],
 }
+// GC2053 MIPI 25fps: 1 line = 30μs
+const ONE_LINE_US: u32 = 30;
+
+/// Exposure: lines → microseconds
+pub fn lines_to_us(lines: u32) -> u32 {
+    lines * ONE_LINE_US
+}
+
+/// Exposure: microseconds → lines
+pub fn us_to_lines(us: u32) -> u32 {
+    (us + ONE_LINE_US / 2) / ONE_LINE_US
+}
+
+/// ISP gain (log2 << 16) → 0.1 dB
+/// dB = gain * 20 * log10(2) / 65536 = gain * 6.0206 / 65536
+/// 0.1 dB = gain * 60.206 / 65536
+pub fn isp_gain_to_db10(gain: u32) -> u32 {
+    ((gain as u64 * 60206 + 65536 * 500) / (65536 * 1000)) as u32
+}
+
+/// 0.1 dB → ISP gain (log2 << 16)
+pub fn db10_to_isp_gain(db10: u32) -> u32 {
+    ((db10 as u64 * 65536 * 1000 + 30103) / 60206) as u32
+}
+
 pub struct AtometDev {
     fd: File,
 }
@@ -134,35 +165,31 @@ impl AtometDev {
         }
         Ok(())
     }
-}
 
-/// Apply AE manual attributes (integration time, analog gain, digital gain).
-/// A value of 0 means auto for that parameter.
-pub unsafe fn apply_ae_manual(exposure_us: u32, analog_gain: u32, digital_gain: u32) {
-    let mut ae: IMPISPAEAttr = unsafe { std::mem::zeroed() };
-
-    ae.AeFreezenEn = IMPISPTuningOpsMode_IMPISP_TUNING_OPS_MODE_ENABLE;
-    // Integration time
-    if exposure_us > 0 {
-        ae.AeItManualEn = IMPISPTuningOpsMode_IMPISP_TUNING_OPS_MODE_ENABLE;
-        ae.AeIt = exposure_us;
-        ae.AeFreezenEn = IMPISPTuningOpsMode_IMPISP_TUNING_OPS_MODE_ENABLE;
+    pub fn freeze_ae(&self) -> io::Result<()> {
+        let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), ATOMET_FREEZE_AE as _) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
-    // Analog gain
-    if analog_gain > 0 {
-        ae.AeAGainManualEn = IMPISPTuningOpsMode_IMPISP_TUNING_OPS_MODE_ENABLE;
-        ae.AeAGain = analog_gain;
+    pub fn unfreeze_ae(&self) -> io::Result<()> {
+        let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), ATOMET_UNFREEZE_AE as _) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
-    // Digital gain
-    if digital_gain > 0 {
-        ae.AeDGainManualEn = IMPISPTuningOpsMode_IMPISP_TUNING_OPS_MODE_ENABLE;
-        ae.AeDGain = digital_gain;
-    }
-
-    let ret = unsafe { IMP_ISP_Tuning_SetAeAttr(&mut ae) };
-    if ret != 0 {
-        log::warn!("IMP_ISP_Tuning_SetAeAttr failed: {}", ret);
+    /// Cap ISP digital gain. 0 = no digital gain (1×).
+    /// Value in ISP gain format (log2 << 16). Use db10_to_isp_gain() to convert.
+    pub fn set_max_idg(&self, val: u32) -> io::Result<()> {
+        let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), ATOMET_SET_MAX_IDG as _, &val) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
+

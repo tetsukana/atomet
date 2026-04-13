@@ -91,6 +91,8 @@ struct top_bypass {
 #define ATOMET_GET_TOP_BYPASS   _IOR(ATOMET_IOC_MAGIC, 2, struct top_bypass)
 #define ATOMET_SET_TOP_BYPASS   _IOW(ATOMET_IOC_MAGIC, 3, struct top_bypass)
 #define ATOMET_SET_DAY_NIGHT    _IOW(ATOMET_IOC_MAGIC, 4, int)
-
+#define ATOMET_FREEZE_AE        _IO(ATOMET_IOC_MAGIC, 5)
+#define ATOMET_UNFREEZE_AE      _IO(ATOMET_IOC_MAGIC, 6)
+#define ATOMET_SET_MAX_IDG      _IOW(ATOMET_IOC_MAGIC, 7, uint32_t)
 
 #endif /* ATOMET_H_ */
