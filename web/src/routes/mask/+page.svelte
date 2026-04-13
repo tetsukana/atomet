@@ -14,7 +14,8 @@
 	let mask = $state(new Uint8Array(COLS * ROWS));
 	let painting = $state(false);
 	let brushValue = $state(1); // 1 = mask, 0 = unmask
-	let brushSize = $state(1); // radius in cells (1 = single cell, 2 = 3x3, etc.)
+	let brushSize = $state(3); // radius in cells (1 = single cell, 2 = 3x3, etc.)
+	let eraseMode = $state(false); // toggle for touch: true = unmask
 	let dirty = $state(false);
 	let saving = $state(false);
 	let statusMsg = $state('');
@@ -148,7 +149,7 @@
 	function onTouchStart(e: TouchEvent) {
 		e.preventDefault();
 		painting = true;
-		brushValue = 1;
+		brushValue = eraseMode ? 0 : 1;
 		const cell = cellFromEvent(e);
 		if (cell) paintBrush(cell[0], cell[1]);
 	}
@@ -215,6 +216,8 @@
 			<span class="brush-val">{brushSize}</span>
 		</label>
 
+		<button class="btn" class:active={!eraseMode} onclick={() => eraseMode = false}>Mask</button>
+		<button class="btn" class:active={eraseMode} onclick={() => eraseMode = true}>Erase</button>
 		<button class="btn" onclick={clearMask}>Clear</button>
 		<button class="btn" onclick={fillMask}>Fill All</button>
 		<button class="btn primary" onclick={saveMask} disabled={!dirty || saving}>
@@ -226,7 +229,7 @@
 	</div>
 
 	<p class="hint">
-		Click/drag to mask. Right-click/Ctrl+click to unmask.
+		Click/drag to mask. Right-click/Ctrl+click or Erase mode to unmask.
 	</p>
 
 	<div class="canvas-wrap">
@@ -247,8 +250,8 @@
 
 <style>
 	.mask-page {
-		padding: 1rem;
-		max-width: 720px;
+		padding: 0.75rem;
+		max-width: 90%;
 		margin: 0 auto;
 	}
 
@@ -289,7 +292,8 @@
 	}
 
 	.brush-range {
-		width: 60px;
+		width: 100px;
+		height: 28px;
 		accent-color: #2563eb;
 	}
 
@@ -329,8 +333,8 @@
 	}
 
 	.btn {
-		padding: 0.35rem 0.75rem;
-		font-size: 0.8rem;
+		padding: 0.5rem 1rem;
+		font-size: 0.85rem;
 		border: 1px solid var(--border);
 		border-radius: 5px;
 		background: var(--input);
@@ -340,6 +344,7 @@
 	}
 
 	.btn:hover { background: var(--hover); }
+	.btn.active { background: #2563eb; color: #fff; border-color: #2563eb; }
 
 	.btn.primary {
 		background: #2563eb;
