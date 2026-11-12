@@ -1,6 +1,7 @@
-use crate::config::{SharedAppState, is_within_schedule};
+use crate::config::{SharedAppState, schedule_active};
 use crate::isp::VideoFrame;
 use crate::muxer::Mp4Muxer;
+use crate::paths;
 use crate::watchdog::WatchdogHandle;
 use chrono::{Local, Timelike};
 use isvp_sys::*;
@@ -29,7 +30,7 @@ pub async fn record_regular_task(
                 let now = Local::now();
                 let state = app_state.load();
                 let active = state.record_enabled
-                    && is_within_schedule(now.hour(), state.record_start_hour, state.record_end_hour);
+                    && schedule_active(now, state.record_use_twilight, state.record_twilight_astro, state.record_start_hour, state.record_end_hour, state.latitude, state.longitude);
 
                 if !active {
                     // Close current file if recording is off or outside schedule
@@ -54,12 +55,12 @@ pub async fn record_regular_task(
                         log::error!("Failed to finish muxer: {}", e);
                     }
 
-                    let dir = format!("/media/mmc/records/{}", now.format("%Y/%m/%d/%H"));
-                    let path = format!("{}/{}.mp4", dir, now.format("%M"));
-                    log::info!("Switching to new record file: {}", path);
+                    let dir = paths::record_dir(now);
+                    let path = dir.join(format!("{}.mp4", now.format("%M")));
+                    log::info!("Switching to new record file: {}", path.display());
 
                     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                        log::error!("Failed to create dir '{}': {}", dir, e);
+                        log::error!("Failed to create dir '{}': {}", dir.display(), e);
                         continue;
                     }
 
@@ -75,7 +76,7 @@ pub async fn record_regular_task(
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to create record file '{}': {}", path, e);
+                            log::error!("Failed to create record file '{}': {}", path.display(), e);
                             current_muxer = None;
                         }
                     }
@@ -127,6 +128,8 @@ pub async fn record_detection_task(
 
     // Pre-buffer: accumulates frames from current GOP onward.
     // Only cleared on IDR when not tracking and not recording.
+    // Also capped to prevent unbounded growth during prolonged tracking.
+    const PREBUF_MAX_FRAMES: usize = 250; // ~3s at 25fps
     let mut prebuf: Vec<Arc<VideoFrame>> = Vec::new();
 
     let mut current_muxer: Option<Mp4Muxer<BufWriter<File>>> = None;
@@ -148,12 +151,12 @@ pub async fn record_detection_task(
                 let now = Local::now();
                 let state = app_state.load();
                 let det = state.detection_record_enabled
-                    && is_within_schedule(now.hour(), state.detection_record_start_hour, state.detection_record_end_hour)
+                    && schedule_active(now, state.detection_use_twilight, state.detection_twilight_astro, state.detection_start_hour, state.detection_end_hour, state.latitude, state.longitude)
                     && detection_active.load(Ordering::Relaxed);
 
                 // --- Pre-buffer maintenance ---
-                // Only reset on IDR when idle (no tracking, no recording)
-                if has_idr && !tracking && !recording {
+                // Reset on IDR when idle, or when buffer exceeds cap
+                if has_idr && !recording && (!tracking || prebuf.len() > PREBUF_MAX_FRAMES) {
                     prebuf.clear();
                 }
                 if !recording {
@@ -164,12 +167,12 @@ pub async fn record_detection_task(
                 if !recording && det {
                     // Detection confirmed — open file and flush pre-buffer
                     let now = Local::now();
-                    let dir = format!("/media/mmc/detections/{}", now.format("%Y/%m/%d/%H%M%S"));
-                    let path = format!("{}/video.mp4", dir);
-                    log::info!("Detection recording start: {}", path);
+                    let dir = paths::detection_dir(now);
+                    let path = dir.join("video.mp4");
+                    log::info!("Detection recording start: {}", path.display());
 
                     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                        log::error!("Failed to create dir '{}': {}", dir, e);
+                        log::error!("Failed to create dir '{}': {}", dir.display(), e);
                         continue;
                     }
 
@@ -190,7 +193,7 @@ pub async fn record_detection_task(
                                 Err(e) => log::error!("Failed to create muxer: {}", e),
                             }
                         }
-                        Err(e) => log::error!("Failed to create detection file '{}': {}", path, e),
+                        Err(e) => log::error!("Failed to create detection file '{}': {}", path.display(), e),
                     }
                 } else if recording {
                     if let Some(muxer) = current_muxer.as_mut() {
@@ -267,7 +270,7 @@ pub async fn record_timelapse_task(
                 let now = Local::now();
                 let state = app_state.load();
                 let active = state.timelapse_enabled
-                    && is_within_schedule(now.hour(), state.timelapse_start_hour, state.timelapse_end_hour);
+                    && schedule_active(now, state.timelapse_use_twilight, state.timelapse_twilight_astro, state.timelapse_start_hour, state.timelapse_end_hour, state.latitude, state.longitude);
 
                 if !active {
                     if let Some(muxer) = current_muxer.take() {
@@ -295,12 +298,12 @@ pub async fn record_timelapse_task(
                         log::error!("Failed to finish muxer: {}", e);
                     }
 
-                    let dir = format!("/media/mmc/timelapse/{}", now.format("%Y/%m/%d"));
-                    let path = format!("{}/{}.mp4", dir, now.format("%H"));
-                    log::info!("Switching to new timelapse file: {}", path);
+                    let dir = paths::timelapse_dir(now);
+                    let path = dir.join(format!("{}.mp4", now.format("%H")));
+                    log::info!("Switching to new timelapse file: {}", path.display());
 
                     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                        log::error!("Failed to create dir '{}': {}", dir, e);
+                        log::error!("Failed to create dir '{}': {}", dir.display(), e);
                         continue;
                     }
 
@@ -316,7 +319,7 @@ pub async fn record_timelapse_task(
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to create record file '{}': {}", path, e);
+                            log::error!("Failed to create record file '{}': {}", path.display(), e);
                             current_muxer = None;
                         }
                     }
@@ -352,16 +355,8 @@ pub async fn record_timelapse_task(
 // Disk space cleanup
 // ============================================================
 
-const MMC_PATH: &str = "/media/mmc";
 const FREE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB
 const CLEANUP_INTERVAL_SECS: u64 = 60;
-
-/// Deletion priority: regular → timelapse → detection
-const CLEANUP_DIRS: &[&str] = &[
-    "/media/mmc/records",
-    "/media/mmc/timelapse",
-    "/media/mmc/detections",
-];
 
 /// Periodic task that deletes the oldest date-directories when free space
 /// drops below 1 GB.  Deletes regular recordings first, then timelapse,
@@ -373,7 +368,7 @@ pub async fn disk_cleanup_task(shutdown: Arc<AtomicBool>) {
     while !shutdown.load(Ordering::Relaxed) {
         timer.tick().await;
 
-        let free = match free_space_bytes(MMC_PATH) {
+        let free = match free_space_bytes(paths::ROOT) {
             Some(f) => f,
             None => continue,
         };
@@ -388,7 +383,7 @@ pub async fn disk_cleanup_task(shutdown: Arc<AtomicBool>) {
             FREE_THRESHOLD_BYTES / (1024 * 1024),
         );
 
-        for base_dir in CLEANUP_DIRS {
+        for base_dir in paths::CLEANUP_DIRS {
             if delete_oldest_leaf(base_dir).await {
                 // Deleted something — recheck on next tick
                 break;

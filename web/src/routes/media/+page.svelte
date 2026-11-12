@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { t } from '$lib/i18n';
 
 	type Dir = 'records' | 'timelapse' | 'detections';
 	type FileEntry = { name: string; size: number; modified: number };
@@ -10,9 +11,9 @@
 	let error = $state('');
 
 	const dirs: { id: Dir; label: string }[] = [
-		{ id: 'records',    label: 'Records'    },
-		{ id: 'timelapse',  label: 'Timelapse'  },
-		{ id: 'detections', label: 'Detections' },
+		{ id: 'records',    label: t('Records')    },
+		{ id: 'timelapse',  label: t('Timelapse')  },
+		{ id: 'detections', label: t('Detections') },
 	];
 
 	async function loadFiles(dir: Dir) {
@@ -71,8 +72,8 @@
 
 <div class="page">
 	<div class="page-header">
-		<h1>Media</h1>
-		<span class="file-count">{files.length} files</span>
+		<h1>{t('Media')}</h1>
+		<span class="file-count">{files.length} {t('files')}</span>
 	</div>
 
 	<!-- Tabs -->
@@ -88,7 +89,7 @@
 				{dir.label}
 			</button>
 		{/each}
-		<button class="refresh" onclick={() => loadFiles(activeDir)} disabled={loading} title="Refresh">
+		<button class="refresh" onclick={() => loadFiles(activeDir)} disabled={loading} title={t('Refresh')}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
 				stroke-linecap="round" stroke-linejoin="round"
 				class:spinning={loading}>
@@ -102,12 +103,12 @@
 	{#if loading}
 		<div class="empty">
 			<span class="spinner"></span>
-			Loading…
+			{t('Loading…')}
 		</div>
 	{:else if error}
 		<div class="empty err">{error}</div>
 	{:else if files.length === 0}
-		<div class="empty">No files in /media/mmc/{activeDir}</div>
+		<div class="empty">{t('No files in')} /media/mmc/{activeDir}</div>
 	{:else if activeDir === 'detections'}
 		<div class="thumb-grid">
 			{#each files as f}

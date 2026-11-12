@@ -1,0 +1,9 @@
+# Buildroot busybox config fragment
+# 標準 busybox config に追加で有効化する applet
+# (BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES 経由で読み込まれる)
+
+# Anonymous FTP server (read-only)
+CONFIG_FTPD=y
+CONFIG_FEATURE_FTPD_ACCEPT_BROKEN_LIST=y
+# Listen 用の supervisor
+CONFIG_TCPSVD=y

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { Go2rtcPlayer } from '$lib/player';
+	import { t } from '$lib/i18n';
 
 	const COLS = 80;
 	const ROWS = 45;
@@ -15,7 +16,12 @@
 	let painting = $state(false);
 	let brushValue = $state(1); // 1 = mask, 0 = unmask
 	let brushSize = $state(3); // radius in cells (1 = single cell, 2 = 3x3, etc.)
-	let eraseMode = $state(false); // toggle for touch: true = unmask
+	let tool = $state<'mask' | 'erase' | 'pan'>('mask');
+	let zoom = $state(1);
+	let hover: [number, number] | null = null;
+	let last: [number, number] | null = null;
+	let undoStack: Uint8Array[] = [];
+	let canUndo = $state(false);
 	let dirty = $state(false);
 	let saving = $state(false);
 	let statusMsg = $state('');
@@ -77,37 +83,28 @@
 	}
 
 	function clearMask() {
+		pushUndo();
 		mask = new Uint8Array(COLS * ROWS);
 		dirty = true;
 		draw();
 	}
 
 	function fillMask() {
+		pushUndo();
 		mask = new Uint8Array(COLS * ROWS).fill(1);
 		dirty = true;
 		draw();
 	}
 
-	function cellFromEvent(e: MouseEvent | TouchEvent): [number, number] | null {
+	function cellFromEvent(e: PointerEvent): [number, number] | null {
 		const rect = canvas.getBoundingClientRect();
-		const scaleX = W / rect.width;
-		const scaleY = H / rect.height;
-		let clientX: number, clientY: number;
-		if ('touches' in e) {
-			if (e.touches.length === 0) return null;
-			clientX = e.touches[0].clientX;
-			clientY = e.touches[0].clientY;
-		} else {
-			clientX = e.clientX;
-			clientY = e.clientY;
-		}
-		const x = Math.floor((clientX - rect.left) * scaleX / CELL);
-		const y = Math.floor((clientY - rect.top) * scaleY / CELL);
+		const x = Math.floor(((e.clientX - rect.left) * W) / rect.width / CELL);
+		const y = Math.floor(((e.clientY - rect.top) * H) / rect.height / CELL);
 		if (x < 0 || x >= COLS || y < 0 || y >= ROWS) return null;
 		return [x, y];
 	}
 
-	function paintBrush(cx: number, cy: number) {
+	function stamp(cx: number, cy: number): boolean {
 		const r = brushSize - 1;
 		let changed = false;
 		for (let dy = -r; dy <= r; dy++) {
@@ -122,48 +119,78 @@
 				}
 			}
 		}
-		if (changed) {
-			dirty = true;
-			draw();
-		}
+		return changed;
 	}
 
-	function onPointerDown(e: MouseEvent) {
-		painting = true;
+	// Stamp along a line so fast strokes leave no gaps.
+	function paintLine(x0: number, y0: number, x1: number, y1: number) {
+		const n = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0), 1);
+		let changed = false;
+		for (let i = 0; i <= n; i++) {
+			const x = Math.round(x0 + ((x1 - x0) * i) / n);
+			const y = Math.round(y0 + ((y1 - y0) * i) / n);
+			if (stamp(x, y)) changed = true;
+		}
+		if (changed) dirty = true;
+	}
+
+	function pushUndo() {
+		undoStack.push(mask.slice());
+		if (undoStack.length > 30) undoStack.shift();
+		canUndo = true;
+	}
+
+	function undo() {
+		const prev = undoStack.pop();
+		if (!prev) return;
+		mask = prev;
+		canUndo = undoStack.length > 0;
+		dirty = true;
+		draw();
+	}
+
+	function onPointerDown(e: PointerEvent) {
+		if (tool === 'pan') return; // native scroll
+		if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 2) return;
+		e.preventDefault();
+		canvas.setPointerCapture(e.pointerId);
 		const cell = cellFromEvent(e);
 		if (!cell) return;
-		brushValue = (e.button === 2 || e.ctrlKey) ? 0 : 1;
-		paintBrush(cell[0], cell[1]);
-	}
-
-	function onPointerMove(e: MouseEvent) {
-		if (!painting) return;
-		const cell = cellFromEvent(e);
-		if (cell) paintBrush(cell[0], cell[1]);
-	}
-
-	function onPointerUp() {
-		painting = false;
-	}
-
-	function onTouchStart(e: TouchEvent) {
-		e.preventDefault();
+		const erase = tool === 'erase' || e.button === 2 || e.ctrlKey || (e.buttons & 32) !== 0;
+		brushValue = erase ? 0 : 1;
+		pushUndo();
 		painting = true;
-		brushValue = eraseMode ? 0 : 1;
-		const cell = cellFromEvent(e);
-		if (cell) paintBrush(cell[0], cell[1]);
+		last = cell;
+		hover = cell;
+		paintLine(cell[0], cell[1], cell[0], cell[1]);
+		draw();
 	}
 
-	function onTouchMove(e: TouchEvent) {
-		e.preventDefault();
-		if (!painting) return;
+	function onPointerMove(e: PointerEvent) {
 		const cell = cellFromEvent(e);
-		if (cell) paintBrush(cell[0], cell[1]);
+		hover = e.pointerType === 'touch' ? null : cell;
+		if (painting && cell) {
+			const from = last ?? cell;
+			paintLine(from[0], from[1], cell[0], cell[1]);
+			last = cell;
+		}
+		draw();
 	}
 
-	function onTouchEnd(e: TouchEvent) {
-		e.preventDefault();
+	function onPointerUp(e: PointerEvent) {
+		if (painting && undoStack.length && !dirty) {
+			undoStack.pop(); // stroke changed nothing
+			canUndo = undoStack.length > 0;
+		}
 		painting = false;
+		last = null;
+		if (e.pointerType === 'touch') hover = null;
+		draw();
+	}
+
+	function onPointerLeave() {
+		hover = null;
+		draw();
 	}
 
 	function draw() {
@@ -193,6 +220,13 @@
 				}
 			}
 		}
+		// Brush cursor (mouse / pen hover)
+		if (hover && tool !== 'pan') {
+			const r = brushSize - 1;
+			ctx.strokeStyle = tool === 'erase' ? '#4ade80' : '#fff';
+			ctx.lineWidth = 1.5;
+			ctx.strokeRect((hover[0] - r) * CELL, (hover[1] - r) * CELL, (2 * r + 1) * CELL, (2 * r + 1) * CELL);
+		}
 	}
 
 	function onContextMenu(e: MouseEvent) {
@@ -202,26 +236,31 @@
 	let maskedCount = $derived(mask.reduce((a, v) => a + v, 0));
 </script>
 
-<svelte:window on:mouseup={onPointerUp} />
-
 <div class="mask-page">
 	<div class="toolbar">
-		<h2>Mask Editor</h2>
-		<span class="info">{maskedCount} / {COLS * ROWS} cells masked</span>
+		<h2>{t('Mask Editor')}</h2>
+		<span class="info">{maskedCount} / {COLS * ROWS} {t('cells masked')}</span>
 		<div class="spacer"></div>
 
 		<label class="brush-label">
-			Brush
+			{t('Brush')}
 			<input type="range" min="1" max="8" bind:value={brushSize} class="brush-range" />
 			<span class="brush-val">{brushSize}</span>
 		</label>
 
-		<button class="btn" class:active={!eraseMode} onclick={() => eraseMode = false}>Mask</button>
-		<button class="btn" class:active={eraseMode} onclick={() => eraseMode = true}>Erase</button>
-		<button class="btn" onclick={clearMask}>Clear</button>
-		<button class="btn" onclick={fillMask}>Fill All</button>
+		<button class="btn" class:active={tool === 'mask'} onclick={() => { tool = 'mask'; draw(); }}>{t('Mask')}</button>
+		<button class="btn" class:active={tool === 'erase'} onclick={() => { tool = 'erase'; draw(); }}>{t('Erase')}</button>
+		<button class="btn" class:active={tool === 'pan'} onclick={() => tool = 'pan'}>{t('Pan')}</button>
+		<label class="brush-label">
+			{t('Zoom')}
+			<input type="range" min="1" max="4" step="0.5" bind:value={zoom} class="brush-range" />
+			<span class="brush-val">{zoom}x</span>
+		</label>
+		<button class="btn" onclick={undo} disabled={!canUndo}>{t('Undo')}</button>
+		<button class="btn" onclick={clearMask}>{t('Clear')}</button>
+		<button class="btn" onclick={fillMask}>{t('Fill All')}</button>
 		<button class="btn primary" onclick={saveMask} disabled={!dirty || saving}>
-			{saving ? 'Saving...' : 'Save'}
+			{saving ? t('Saving...') : t('Save')}
 		</button>
 		{#if statusMsg}
 			<span class="status" class:error={statusMsg.startsWith('Error')}>{statusMsg}</span>
@@ -229,22 +268,24 @@
 	</div>
 
 	<p class="hint">
-		Click/drag to mask. Right-click/Ctrl+click or Erase mode to unmask.
+		{t('Click/drag to mask. Right-click/Ctrl+click or Erase mode to unmask.')}
 	</p>
 
-	<div class="canvas-wrap">
-		<video bind:this={videoEl} autoplay muted playsinline class="bg-video"></video>
+	<div class="canvas-wrap" class:panning={tool === 'pan'}>
+		<div class="stage" style:width="{zoom * 100}%">
+		<video bind:this={videoEl} autoplay muted playsinline webkit-playsinline class="bg-video"></video>
 		<canvas
 			bind:this={canvas}
 			width={W}
 			height={H}
-			onmousedown={onPointerDown}
-			onmousemove={onPointerMove}
+			onpointerdown={onPointerDown}
+			onpointermove={onPointerMove}
+			onpointerup={onPointerUp}
+			onpointercancel={onPointerUp}
+			onpointerleave={onPointerLeave}
 			oncontextmenu={onContextMenu}
-			ontouchstart={onTouchStart}
-			ontouchmove={onTouchMove}
-			ontouchend={onTouchEnd}
 		></canvas>
+		</div>
 	</div>
 </div>
 
@@ -309,8 +350,14 @@
 		position: relative;
 		border: 1px solid var(--border);
 		border-radius: 6px;
-		overflow: hidden;
+		overflow: auto;
 		background: #000;
+		max-height: 75vh;
+		overscroll-behavior: contain;
+	}
+
+	.stage {
+		position: relative;
 		aspect-ratio: 640 / 360;
 	}
 
@@ -320,6 +367,11 @@
 		width: 100%;
 		height: 100%;
 		object-fit: contain;
+		z-index: 0;
+		/* Force own compositing layer — works around an iPad Safari quirk where a
+		   stacked transparent canvas can prevent the underlying <video> frame
+		   from being drawn. */
+		transform: translateZ(0);
 	}
 
 	canvas {
@@ -330,6 +382,10 @@
 		height: 100%;
 		cursor: crosshair;
 		touch-action: none;
+		user-select: none;
+		-webkit-user-select: none;
+		z-index: 1;
+		background: transparent;
 	}
 
 	.btn {
@@ -343,6 +399,8 @@
 		transition: background 0.15s;
 	}
 
+	.panning canvas { touch-action: pan-x pan-y; cursor: grab; }
+
 	.btn:hover { background: var(--hover); }
 	.btn.active { background: #2563eb; color: #fff; border-color: #2563eb; }
 
@@ -353,7 +411,14 @@
 	}
 
 	.btn.primary:hover { background: #1d4ed8; }
-	.btn.primary:disabled { opacity: 0.4; cursor: default; }
+	.btn.primary:disabled, .btn:disabled { opacity: 0.4; cursor: default; }
+
+	@media (pointer: coarse) {
+		.mask-page { max-width: 100%; padding: 0.5rem; }
+		.btn { min-height: 44px; min-width: 44px; padding: 0.5rem 0.9rem; }
+		.brush-range { width: 130px; height: 44px; }
+		.toolbar { gap: 0.5rem; }
+	}
 
 	.status {
 		font-size: 0.8rem;

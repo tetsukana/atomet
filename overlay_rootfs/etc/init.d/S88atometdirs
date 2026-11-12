@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# Ensure atomet directory layout exists under /media/mmc.
+# Idempotent: safe to run on every boot.
+#
+# Layout:
+#   /media/mmc/config/      atomet.toml, mask.bin, solver-db.bin, sensor-cal.bin
+#   /media/mmc/logs/        atomet.log
+#   /media/mmc/records/     YYYY/MM/DD/HH/mm.mp4   (continuous HEVC)
+#   /media/mmc/timelapse/   YYYY/MM/DD/HH.mp4      (timelapse HEVC)
+#   /media/mmc/detections/  YYYY/MM/DD/HHMMSS/...  (detection clips)
+#   /media/mmc/stills/      YYYY/MM/DD/*.fits      (single-frame captures)
+#   /media/mmc/ff/          YYYY/MM/DD/HH/*.fits   (FF stack blocks)
+#
+
+MMC=/media/mmc
+DIRS="config logs records timelapse detections stills ff ff/detections"
+
+case "$1" in
+    start)
+        if [ ! -d "$MMC" ]; then
+            echo "WARNING: $MMC not mounted, skipping atomet dir creation"
+            exit 0
+        fi
+        for d in $DIRS; do
+            mkdir -p "$MMC/$d"
+        done
+        # Sweep orphan-cluster recovery files left by fsck.fat / fsck.exfat
+        # (FSCK????.REC) and any CHKDSK leftovers (FOUND.???/FILE????.CHK)
+        # after unclean shutdowns. They are never valid playable MP4s.
+        rm -f "$MMC"/FSCK????.REC 2>/dev/null
+        rm -rf "$MMC"/FOUND.??? 2>/dev/null
+        ;;
+    stop|restart|reload)
+        : # noop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

@@ -1,5 +1,5 @@
-use crate::ae_ctrl::AeParams;
-use crate::config::{IspInfo, SystemInfo};
+use crate::ae_ctrl::{AeParams, isp_gain_to_db10, lines_to_us};
+use crate::config::{IspInfo, SharedAppState, SystemInfo};
 use isvp_sys::{
     IMP_ISP_Tuning_GetAeHist_Origin, IMP_ISP_Tuning_GetEVAttr, IMPISPAEHistOrigin, IMPISPEVAttr,
 };
@@ -9,10 +9,59 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, interval};
 
+/// Apply a POSIX TZ string (e.g. "JST-9", "UTC0", "EST5EDT,M3.2.0,M11.1.0").
+/// Sets the TZ env var, runs tzset(3) so libc/chrono pick it up, and writes
+/// /etc/TZ (BusyBox reads this on boot).
+pub fn apply_timezone(tz: &str) {
+    unsafe extern "C" {
+        fn tzset();
+    }
+    // SAFETY: called from a single sync context (startup or WS handler);
+    // no other thread is concurrently reading TZ at this moment.
+    unsafe {
+        std::env::set_var("TZ", tz);
+        tzset();
+    }
+    if let Err(e) = std::fs::write("/etc/TZ", format!("{}\n", tz)) {
+        log::warn!("Failed to write /etc/TZ: {}", e);
+    }
+    log::info!("Timezone set to {}", tz);
+}
+
 /// Reboot the device.
 pub fn reboot() {
     log::info!("Rebooting system...");
     let _ = std::process::Command::new("reboot").spawn();
+}
+
+/// Wait for the next scheduled reboot moment, then reboot.
+///
+/// Fires once per day when local time enters the user-configured hour. Guard
+/// rails: only fires when uptime > 5 minutes (so a reboot at the configured
+/// hour can't trigger a boot loop) and only inside the first minute of the
+/// target hour (so we don't fire repeatedly).
+pub async fn scheduled_reboot_task(app_state: SharedAppState, shutdown: Arc<AtomicBool>) {
+    use chrono::Timelike;
+    let mut ticker = interval(Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let s = app_state.load();
+        if !s.scheduled_reboot_enabled {
+            continue;
+        }
+        if uptime_secs() < 300.0 {
+            continue;
+        }
+        let now = chrono::Local::now();
+        if now.hour() == s.scheduled_reboot_hour && now.minute() == 0 {
+            log::info!("Scheduled reboot trigger ({}:00 local)", now.hour());
+            reboot();
+            break;
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -164,20 +213,20 @@ pub async fn ispstat_broadcast_task(tx: broadcast::Sender<String>, shutdown: Arc
         let histogram = read_histogram();
 
         isp_info.ae_mode = ae.ae_mode;
-        isp_info.it = ae.it_value;
-        isp_info.ag = ae.ag_value;
+        isp_info.it = lines_to_us(ae.it_value);
+        isp_info.ag = isp_gain_to_db10(ae.ag_value);
         isp_info.ag_i = again;
-        isp_info.sdg = ae.sdg_value;
-        isp_info.idg = ae.idg_value;
+        isp_info.sdg = isp_gain_to_db10(ae.sdg_value);
+        isp_info.idg = isp_gain_to_db10(ae.idg_value);
         isp_info.idg_i = dgain;
-        isp_info.max_it = ae.max_it;
-        isp_info.max_ag = ae.max_ag;
-        isp_info.max_sdg = ae.max_sdg;
-        isp_info.max_idg = ae.max_idg;
-        isp_info.min_it = ae.min_it;
-        isp_info.min_ag = ae.min_ag;
-        isp_info.min_sdg = ae.min_sdg;
-        isp_info.min_idg = ae.min_idg;
+        isp_info.max_it = lines_to_us(ae.max_it);
+        isp_info.max_ag = isp_gain_to_db10(ae.max_ag);
+        isp_info.max_sdg = isp_gain_to_db10(ae.max_sdg);
+        isp_info.max_idg = isp_gain_to_db10(ae.max_idg);
+        isp_info.min_it = lines_to_us(ae.min_it);
+        isp_info.min_ag = isp_gain_to_db10(ae.min_ag);
+        isp_info.min_sdg = isp_gain_to_db10(ae.min_sdg);
+        isp_info.min_idg = isp_gain_to_db10(ae.min_idg);
         isp_info.fps_actual = 0;
         isp_info.histogram = histogram.to_vec();
 

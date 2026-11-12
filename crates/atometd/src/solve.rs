@@ -1,306 +1,259 @@
-use arc_swap::ArcSwap;
 use imgproc::*;
-use solver::extractor::{self, Star};
+use solver::extractor::{self, RefinedStar};
+use solver::calib::{self, LensModel, Pose};
 use solver::{Database, Equatorial};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{broadcast, watch};
 
-use crate::config::SharedAppState;
-use crate::luma;
-use crate::watchdog::WatchdogHandle;
+use crate::paths;
 
-const WIDTH: usize = 640;
-const HEIGHT: usize = 360;
+pub const WIDTH: usize = 640;
+pub const HEIGHT: usize = 360;
 const ROW_STRIDE: usize = WIDTH + 2; // 1-byte padding each side
 
-// Star extraction tuning
-const EXTRACT_FRAMES: usize = 100;
-const CALIB_FRAMES: usize = 5;
-
 // Plate solver tuning
-const DB_PATH: &str = "/media/mmc/database.bin";
 /// ATOM Cam2 gc2053: ~3.1mm focal length, 3.0µm pixel pitch
 /// At 640×360 (3:1 downsample from 1920×1080): effective pixel = 9.0µm
 /// focal_length_px = 3.1mm / 0.009mm ≈ 344
-const FOCAL_LENGTH_PX: f32 = 344.0;
+pub const FOCAL_LENGTH_PX: f32 = 344.0;
 /// Angular matching tolerance for vote accumulation (0.5° → cos)
-const DOT_THRESHOLD: f32 = 0.9999619; // cos(0.5°)
-const MAX_HYPOTHESES: usize = 200;
-const EARLY_STOP_VOTES: usize = 6;
+pub const DOT_THRESHOLD: f32 = 0.9999619; // cos(0.5°)
+pub const MAX_HYPOTHESES: usize = 200;
+pub const EARLY_STOP_VOTES: usize = 6;
 
 // Cell grid constants (must match detection.rs)
 const CELL_SIZE: usize = 8;
 const CELLS_X: usize = WIDTH / CELL_SIZE; // 80
 const CELLS_Y: usize = HEIGHT / CELL_SIZE; // 45
 
-pub fn solve_task(
-    mut luma_rx: watch::Receiver<Option<luma::LumaFrame>>,
-    _app_state: SharedAppState,
-    shutdown: Arc<AtomicBool>,
-    wd: WatchdogHandle,
-    debug_tx: broadcast::Sender<String>,
-    stack_capture: Arc<AtomicBool>,
-    mask: Arc<ArcSwap<Vec<u8>>>,
-) {
-    let handle = tokio::runtime::Handle::current();
-
-    // Pre-allocated buffers (reused across extractions)
-    let mut vote_map = vec![0u8; WIDTH * HEIGHT];
-    let mut rows = [[0u8; ROW_STRIDE]; 3];
-
-    // Load plate solver database
-    let db = match std::fs::read(DB_PATH) {
-        Ok(data) => {
-            log::info!(
-                "Loaded solver database from {} ({} bytes)",
-                DB_PATH,
-                data.len()
-            );
-            Some(Database::load_from_bytes(&data))
-        }
-        Err(e) => {
-            log::warn!(
-                "Solver database not found ({}): {} — plate solving disabled",
-                DB_PATH,
-                e
-            );
-            None
-        }
-    };
-
-    log::info!(
-        "Solve task started ({}×{}, focal_length={}px)",
-        WIDTH,
-        HEIGHT,
-        FOCAL_LENGTH_PX
-    );
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        wd.tick();
-
-        // Wait for luma frame as timing signal
-        match handle.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            luma_rx.changed(),
-        )) {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => break,
-            Err(_) => continue,
-        }
-        let _ = luma_rx.borrow_and_update();
-
-        if stack_capture.load(Ordering::Relaxed) {
-            let t0 = std::time::Instant::now();
-
-            // Phase 1-3: Star extraction (SIMD voting + candidate extraction)
-            let stars = extract_stars(
-                &mut vote_map,
-                &mut rows,
-                &mut luma_rx,
-                &shutdown,
-                &wd,
-                &handle,
-            );
-
-            // Filter out stars in masked cells
-            let mask_snap = mask.load();
-            let stars: Vec<Star> = stars
-                .into_iter()
-                .filter(|s| {
-                    let cx = s.x as usize / CELL_SIZE;
-                    let cy = s.y as usize / CELL_SIZE;
-                    if cx < CELLS_X && cy < CELLS_Y {
-                        mask_snap[cy * CELLS_X + cx] == 0
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-
-            let extract_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            log::info!(
-                "Star extraction: {} stars in {:.1}ms ({} frames)",
-                stars.len(),
-                extract_ms,
-                EXTRACT_FRAMES,
-            );
-
-            // Send star list via debug channel
-            if !stars.is_empty() && debug_tx.receiver_count() > 0 {
-                let stars_json: Vec<String> = stars
-                    .iter()
-                    .map(|s| format!("[{},{},{}]", s.x, s.y, s.votes))
-                    .collect();
-                let msg = format!(
-                    r#"{{"type":"stars","count":{},"stars":[{}]}}"#,
-                    stars.len(),
-                    stars_json.join(","),
+/// Load the plate solver database from disk, logging the outcome.
+///
+/// The SD-card copy (`paths::SOLVER_DB`) overrides the one built into the
+/// rootfs (`paths::SOLVER_DB_BUILTIN`), so a custom database can be tried
+/// without reflashing. Returns `None` (plate solving disabled) if neither
+/// exists.
+pub fn load_database() -> Option<Database> {
+    for path in [paths::SOLVER_DB, paths::SOLVER_DB_BUILTIN] {
+        match std::fs::read(path) {
+            Ok(data) => {
+                log::info!(
+                    "Loaded solver database from {} ({} bytes)",
+                    path,
+                    data.len()
                 );
-                let _ = debug_tx.send(msg);
+                return Some(Database::load_from_bytes(&data));
             }
-
-            // Phase 4: Plate solve
-            if let Some(ref db) = db {
-                if stars.len() >= 4 {
-                    let centroids = extractor::stars_to_centroids(&stars, WIDTH, HEIGHT);
-                    let t1 = std::time::Instant::now();
-
-                    let result = db.solve(
-                        &centroids,
-                        (0.0, 0.0),
-                        FOCAL_LENGTH_PX,
-                        DOT_THRESHOLD,
-                        MAX_HYPOTHESES,
-                        Some(EARLY_STOP_VOTES),
-                    );
-
-                    let solve_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
-                    match result {
-                        Some(sol) => {
-                            let eq = Equatorial::from_cartesian(sol.pointing);
-                            let ra_deg = eq.ra.to_degrees();
-                            let dec_deg = eq.dec.to_degrees();
-                            let roll_deg = sol.roll.to_degrees();
-
-                            log::info!(
-                                "Plate solve: RA={:.3}° Dec={:.3}° Roll={:.1}° votes={} in {:.1}ms",
-                                ra_deg,
-                                dec_deg,
-                                roll_deg,
-                                sol.votes,
-                                solve_ms,
-                            );
-
-                            if debug_tx.receiver_count() > 0 {
-                                let msg = format!(
-                                    r#"{{"type":"solve","ra":{:.4},"dec":{:.4},"roll":{:.2},"votes":{},"stars":{},"extract_ms":{:.1},"solve_ms":{:.1}}}"#,
-                                    ra_deg,
-                                    dec_deg,
-                                    roll_deg,
-                                    sol.votes,
-                                    stars.len(),
-                                    extract_ms,
-                                    solve_ms,
-                                );
-                                let _ = debug_tx.send(msg);
-                            }
-                        }
-                        None => {
-                            log::info!(
-                                "Plate solve: no solution ({} stars, {:.1}ms)",
-                                stars.len(),
-                                solve_ms
-                            );
-                            if debug_tx.receiver_count() > 0 {
-                                let msg = format!(
-                                    r#"{{"type":"solve","ra":null,"dec":null,"roll":null,"votes":0,"stars":{},"extract_ms":{:.1},"solve_ms":{:.1}}}"#,
-                                    stars.len(),
-                                    extract_ms,
-                                    solve_ms,
-                                );
-                                let _ = debug_tx.send(msg);
-                            }
-                        }
-                    }
-                } else {
-                    log::info!("Plate solve: too few stars ({}), need ≥ 4", stars.len());
-                }
-            }
-
-            stack_capture.store(false, Ordering::Relaxed);
+            Err(e) => log::info!("Solver database not at {}: {}", path, e),
         }
     }
+    log::warn!("No solver database found — plate solving disabled");
+    None
+}
+
+/// Angular radius (from the image center, assumed to be the optical axis)
+/// of the first solve attempt. Lens distortion grows with the off-axis
+/// angle and the solver models none, so the central stars are tried first.
+const CENTER_STAGE_DEG: f32 = 30.0;
+
+/// A validated plate solution.
+#[derive(Debug, Clone, Copy)]
+pub struct SolveOutcome {
+    pub ra: f64,
+    pub dec: f64,
+    pub roll: f64,
+    /// Pattern-matcher votes for the initial attitude.
+    pub votes: usize,
+    /// Stars matched to the catalog after calibration (whole frame).
+    pub matched: usize,
+    /// …of which beyond `calib::INNER_DEG` — independent of the pattern match.
+    pub outer: usize,
+    /// Residual RMS in pixels.
+    pub rms_px: f64,
+    /// Fitted lens profile (`r = f·(θ + c3·θ³ + c5·θ⁵)`), for reuse as a prior.
+    pub lens: LensModel,
+    /// Full attitude (pointing + roll) behind `ra`/`dec`/`roll`.
+    pub pose: Pose,
+}
+
+fn outcome(cal: &calib::Calibration, votes: usize) -> SolveOutcome {
+    let eq = Equatorial::from_cartesian(cal.pose.pointing_vec3());
+    SolveOutcome {
+        ra: eq.ra.to_degrees() as f64,
+        dec: eq.dec.to_degrees() as f64,
+        roll: cal.pose.roll.to_degrees(),
+        votes,
+        matched: cal.matched,
+        outer: cal.outer,
+        rms_px: cal.rms_px,
+        lens: cal.lens,
+        pose: cal.pose,
+    }
+}
+
+/// Plate-solve a list of star positions in WIDTH×HEIGHT pixel coordinates.
+///
+/// 1. Pattern matching gives an initial attitude. Stars within
+///    `CENTER_STAGE_DEG` of the image center (taken as the optical axis) are
+///    tried first, then all of them. With a `prior` lens profile the stars are
+///    first mapped to pinhole coordinates, so the whole frame is usable.
+/// 2. `calib::calibrate` projects the catalog, fits the lens profile / axis /
+///    roll ring by ring, and validates against stars beyond 30° that the
+///    pattern matcher never relied on.
+///
+/// Returns `None` if no attitude was found or it failed validation (a
+/// pattern-only solution is not reported). Without a usable prior the attempt
+/// is repeated assuming a pinhole.
+pub fn solve_stars(
+    db: &Database,
+    stars_px: &[(f32, f32)],
+    prior: Option<&LensModel>,
+) -> Option<SolveOutcome> {
+    if stars_px.len() < 4 {
+        return None;
+    }
+    let cx = WIDTH as f32 / 2.0;
+    let cy = HEIGHT as f32 / 2.0;
+    let centered: Vec<(f32, f32)> = stars_px.iter().map(|&(x, y)| (x - cx, y - cy)).collect();
+
+    let pinhole = LensModel::pinhole(FOCAL_LENGTH_PX as f64);
+    let attempts: Vec<(LensModel, &str)> = match prior {
+        Some(p) => vec![(*p, "prior lens"), (pinhole, "pinhole")],
+        None => vec![(pinhole, "pinhole")],
+    };
+    for (lens0, label) in attempts {
+        // Pinhole coordinates for the pattern matcher, scale-matched to `lens0`.
+        let f_pin = lens0.f as f32;
+        let working: Vec<(f32, f32)> = match lens0.shape {
+            calib::Shape::Pinhole => centered.clone(),
+            calib::Shape::Poly { .. } => centered
+                .iter()
+                .filter_map(|&(x, y)| {
+                    lens0
+                        .to_pinhole(x as f64, y as f64, f_pin as f64)
+                        .map(|(a, b)| (a as f32, b as f32))
+                })
+                .collect(),
+        };
+        let Some((sol, stage)) = initial_attitude(db, &working, f_pin) else {
+            log::info!("solve_stars: no pattern match ({label}, {} stars)", working.len());
+            continue;
+        };
+        let Some(cal) = calib::calibrate(&db.stars, &centered, Pose::from_attitude(&sol), lens0)
+        else {
+            log::info!("solve_stars: calibration found nothing to fit ({label}, {stage}, votes={})", sol.votes);
+            continue;
+        };
+        log::info!(
+            "solve_stars: {label}/{stage}: votes={} matched={} outer={} (chance {:.1}) rms={:.2}px f={:.1} → {}",
+            sol.votes,
+            cal.matched,
+            cal.outer,
+            cal.outer_chance,
+            cal.rms_px,
+            cal.lens.f,
+            if cal.valid { "valid" } else { "REJECTED" },
+        );
+        if !cal.valid {
+            continue;
+        }
+        return Some(outcome(&cal, sol.votes));
+    }
+    None
+}
+
+/// Pattern-match an attitude from centered pinhole-like coordinates
+/// (focal length `f_pin` px): central stars first, then all.
+fn initial_attitude(
+    db: &Database,
+    all: &[(f32, f32)],
+    f_pin: f32,
+) -> Option<(solver::AttitudeSolution, &'static str)> {
+    // Pinhole model: angle from the axis θ = atan(r / f) ⇒ r_max = f·tan(θ_max).
+    let r_max = f_pin * CENTER_STAGE_DEG.to_radians().tan();
+    let central: Vec<(f32, f32)> = all
+        .iter()
+        .copied()
+        .filter(|&(x, y)| x.hypot(y) <= r_max)
+        .collect();
+
+    if central.len() >= 4 && central.len() < all.len() {
+        match solve_centroids(db, &central, f_pin) {
+            Some(sol) => Some((sol, "central")),
+            None => Some((solve_centroids(db, all, f_pin)?, "all (central failed)")),
+        }
+    } else {
+        Some((solve_centroids(db, all, f_pin)?, "all"))
+    }
+}
+
+fn solve_centroids(
+    db: &Database,
+    centroids: &[(f32, f32)],
+    f_pin: f32,
+) -> Option<solver::AttitudeSolution> {
+    db.solve(
+        centroids,
+        (0.0, 0.0),
+        f_pin,
+        DOT_THRESHOLD,
+        MAX_HYPOTHESES,
+        Some(EARLY_STOP_VOTES),
+    )
 }
 
 // ============================================================
 // SIMD-dependent frame processing (requires imgproc crate)
 // ============================================================
 
-/// Run star extraction over EXTRACT_FRAMES luma frames.
-fn extract_stars(
-    vote_map: &mut [u8],
-    rows: &mut [[u8; ROW_STRIDE]; 3],
-    luma_rx: &mut watch::Receiver<Option<luma::LumaFrame>>,
-    shutdown: &AtomicBool,
-    wd: &WatchdogHandle,
-    handle: &tokio::runtime::Handle,
-) -> Vec<Star> {
-    vote_map.fill(0);
+/// Extract stars from a single frame (e.g. an FF block's avepixel).
+///
+/// Calibrates the contrast threshold on the frame itself (masked pixels
+/// excluded from the histogram), runs one voting pass with masked pixels
+/// excluded from voting, then refines the 3×3 local maxima to sub-pixel
+/// centroids with background-subtracted flux, sorted by flux descending.
+///
+/// `mask` is the 80×45 cell mask (non-zero = masked).
+/// Returns the refined stars and the threshold used.
+pub fn extract_stars_from_frame(frame: &[u8], mask: &[u8]) -> (Vec<RefinedStar>, u8) {
+    debug_assert_eq!(frame.len(), WIDTH * HEIGHT);
+    let mask_px = expand_cell_mask(mask);
+    let mut rows = [[0u8; ROW_STRIDE]; 3];
 
-    // --- Phase 1: Calibrate threshold ---
     let mut hist = [0u32; 256];
-    let mut calib_frames_data: Vec<Arc<Vec<u8>>> = Vec::with_capacity(CALIB_FRAMES);
-
-    for _ in 0..CALIB_FRAMES {
-        if shutdown.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
-        wd.tick();
-
-        let frame = match wait_frame(luma_rx, handle) {
-            Some(f) => f,
-            None => return Vec::new(),
-        };
-
-        calibrate_frame(&frame.data, rows, &mut hist);
-        calib_frames_data.push(Arc::clone(&frame.data));
-    }
-
+    calibrate_frame(frame, &mask_px, &mut rows, &mut hist);
     let threshold = extractor::compute_threshold(&hist);
-    log::info!("Star extract: threshold={}", threshold);
 
-    // --- Phase 2: Vote ---
-    for data in &calib_frames_data {
-        vote_frame(data, rows, vote_map, threshold);
-    }
-    drop(calib_frames_data);
+    let mut vote_map = vec![0u8; WIDTH * HEIGHT];
+    vote_frame(frame, &mask_px, &mut rows, &mut vote_map, threshold);
 
-    for i in CALIB_FRAMES..EXTRACT_FRAMES {
-        if shutdown.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
-        wd.tick();
-
-        let frame = match wait_frame(luma_rx, handle) {
-            Some(f) => f,
-            None => return Vec::new(),
-        };
-
-        vote_frame(&frame.data, rows, vote_map, threshold);
-
-        if (i + 1) % 25 == 0 {
-            log::info!("Star extract: {}/{} frames", i + 1, EXTRACT_FRAMES);
-        }
-    }
-
-    // --- Phase 3: Extract candidates ---
-    let min_votes = (EXTRACT_FRAMES / 2) as u8;
-    extractor::extract_candidates(vote_map, WIDTH, HEIGHT, min_votes)
+    let stars = extractor::extract_candidates(&vote_map, WIDTH, HEIGHT, 1);
+    let refined = extractor::refine_stars(frame, WIDTH, HEIGHT, &stars);
+    (refined, threshold)
 }
 
-/// Wait for next luma frame with 3s timeout.
-fn wait_frame(
-    luma_rx: &mut watch::Receiver<Option<luma::LumaFrame>>,
-    handle: &tokio::runtime::Handle,
-) -> Option<luma::LumaFrame> {
-    match handle.block_on(tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        luma_rx.changed(),
-    )) {
-        Ok(Ok(())) => {}
-        _ => return None,
+/// Expand the 80×45 cell mask (non-zero = masked) to a full-resolution
+/// per-pixel mask for the SIMD kernels.
+fn expand_cell_mask(cell_mask: &[u8]) -> Vec<u8> {
+    let mut px = vec![0u8; WIDTH * HEIGHT];
+    for cy in 0..CELLS_Y {
+        for cx in 0..CELLS_X {
+            if cell_mask[cy * CELLS_X + cx] != 0 {
+                for y in (cy * CELL_SIZE)..((cy + 1) * CELL_SIZE) {
+                    let off = y * WIDTH + cx * CELL_SIZE;
+                    px[off..off + CELL_SIZE].fill(0xff);
+                }
+            }
+        }
     }
-    luma_rx.borrow_and_update().clone()
+    px
 }
 
 /// Process one frame for threshold calibration (contrast histogram).
-fn calibrate_frame(data: &[u8], rows: &mut [[u8; ROW_STRIDE]; 3], hist: &mut [u32; 256]) {
+/// `mask_px` is the per-pixel mask (WIDTH×HEIGHT, non-zero = excluded).
+fn calibrate_frame(
+    data: &[u8],
+    mask_px: &[u8],
+    rows: &mut [[u8; ROW_STRIDE]; 3],
+    hist: &mut [u32; 256],
+) {
     load_row(data, 0, &mut rows[0]);
     load_row(data, 1, &mut rows[1]);
 
@@ -316,6 +269,7 @@ fn calibrate_frame(data: &[u8], rows: &mut [[u8; ROW_STRIDE]; 3], hist: &mut [u3
                 rows[prev_idx].as_ptr().add(1),
                 rows[curr_idx].as_ptr().add(1),
                 rows[next_idx].as_ptr().add(1),
+                mask_px.as_ptr().add(y * WIDTH),
                 hist.as_mut_ptr(),
             );
         }
@@ -323,7 +277,14 @@ fn calibrate_frame(data: &[u8], rows: &mut [[u8; ROW_STRIDE]; 3], hist: &mut [u3
 }
 
 /// Process one frame for voting.
-fn vote_frame(data: &[u8], rows: &mut [[u8; ROW_STRIDE]; 3], vote_map: &mut [u8], threshold: u8) {
+/// `mask_px` is the per-pixel mask (WIDTH×HEIGHT, non-zero = excluded).
+fn vote_frame(
+    data: &[u8],
+    mask_px: &[u8],
+    rows: &mut [[u8; ROW_STRIDE]; 3],
+    vote_map: &mut [u8],
+    threshold: u8,
+) {
     load_row(data, 0, &mut rows[0]);
     load_row(data, 1, &mut rows[1]);
 
@@ -339,6 +300,7 @@ fn vote_frame(data: &[u8], rows: &mut [[u8; ROW_STRIDE]; 3], vote_map: &mut [u8]
                 rows[prev_idx].as_ptr().add(1),
                 rows[curr_idx].as_ptr().add(1),
                 rows[next_idx].as_ptr().add(1),
+                mask_px.as_ptr().add(y * WIDTH),
                 vote_map.as_mut_ptr().add(y * WIDTH),
                 threshold,
             );

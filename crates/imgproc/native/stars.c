@@ -19,6 +19,10 @@
  * prev/curr/next point to row buffers with 1-byte padding on each side,
  * i.e. prev = &rows[(y-1)%3][1], so prev[-1] and prev[640] are valid.
  *
+ * mask = per-pixel mask for the center row (no padding); non-zero = excluded
+ * from voting. Masked pixels still participate as neighbours of unmasked
+ * pixels (real image data, no artificial edges).
+ *
  * vote_row = &vote_map[y * 640]
  * thresh_vec = threshold broadcast to all 16 bytes
  */
@@ -26,12 +30,16 @@ void stars_process_row(
     const uint8_t *prev,
     const uint8_t *curr,
     const uint8_t *next,
+    const uint8_t *mask,
     uint8_t       *vote_row,
     uint8_t        threshold
 ) {
     uint8_t tbuf[16];
     memset(tbuf, threshold, 16);
     v16u8 thresh_vec = (v16u8)_mx128_lu1q((void*)tbuf, 0);
+    uint8_t zbuf[16];
+    memset(zbuf, 0, 16);
+    v16i8 zero_vec = _mx128_lu1q((void*)zbuf, 0);
     int x;
 
     for (x = 0; x < STAR_WIDTH; x += 16) {
@@ -73,11 +81,15 @@ void stars_process_row(
         /* contrast > threshold  ⟺  threshold < contrast */
         v16i8 above = _mx128_cltu_b(thresh_vec, contrast);
 
-        /* Both conditions: is_peak AND above_threshold */
-        v16i8 mask = _mx128_andv(is_peak, above);
+        /* unmasked lanes: mask byte == 0 → 0xFF */
+        v16i8 m = _mx128_lu1q((void*)(mask + x), 0);
+        v16i8 unmasked = _mx128_ceq_b(m, zero_vec);
+
+        /* All conditions: is_peak AND above_threshold AND unmasked */
+        v16i8 cond = _mx128_andv(_mx128_andv(is_peak, above), unmasked);
 
         /* 0xFF → 0x01 */
-        v16i8 ones = _mx128_andib(mask, 1);
+        v16i8 ones = _mx128_andib(cond, 1);
 
         /* Accumulate into vote_map (saturating add) */
         v16u8 vmap = (v16u8)_mx128_lu1q((void*)(vote_row + x), 0);
@@ -89,11 +101,15 @@ void stars_process_row(
 /* Calibrate threshold from a single row's contrast values.
  * Same 3×3 kernel but instead of voting, accumulates a contrast histogram.
  * hist must be a uint32_t[256] array (caller manages accumulation across rows/frames).
+ * mask = per-pixel mask for the center row; non-zero pixels are excluded
+ * from the histogram so high-contrast masked features (buildings, lights)
+ * don't skew the threshold.
  */
 void stars_calibrate_row(
     const uint8_t *prev,
     const uint8_t *curr,
     const uint8_t *next,
+    const uint8_t *mask,
     uint32_t      *hist
 ) {
     int x;
@@ -127,7 +143,9 @@ void stars_calibrate_row(
         _mx128_su1q((v16i8)contrast, (void*)buf, 0);
         int i;
         for (i = 0; i < 16; i++) {
-            hist[buf[i]]++;
+            if (mask[x + i] == 0) {
+                hist[buf[i]]++;
+            }
         }
     }
 }

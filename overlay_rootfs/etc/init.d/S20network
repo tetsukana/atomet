@@ -113,7 +113,10 @@ EOF
 
     [ -n "$HWADDR" ] && ifconfig wlan0 hw ether "$HWADDR" 2>/dev/null || true
     wpa_supplicant -D nl80211 -i wlan0 -c "$WPA_CONF" -B
-    udhcpc -i wlan0 -x hostname:atomet -p /var/run/udhcpc.pid -b &
+    udhcpc -i wlan0 -x hostname:atomet -p /var/run/udhcpc.wlan0.pid -b
+
+    # 切断→再接続のたびに DHCP を取り直すアクションスクリプトを常駐させる
+    [ -x /etc/wpa_action.sh ] && wpa_cli -i wlan0 -a /etc/wpa_action.sh -B
 
     count=0
     while ! ifconfig wlan0 | grep -q 'inet addr'; do
@@ -128,6 +131,7 @@ EOF
 }
 
 stop_network() {
+    killall wpa_cli 2>/dev/null || true
     killall wpa_supplicant 2>/dev/null || true
     killall udhcpc 2>/dev/null || true
     ifconfig wlan0 down 2>/dev/null || true

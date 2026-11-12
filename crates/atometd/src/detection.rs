@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
-use crate::config::SharedAppState;
+use crate::config::{SharedAppState, schedule_active};
 use crate::luma;
+use crate::paths;
 use crate::watchdog::WatchdogHandle;
 
 const INTERVAL: Duration = Duration::from_secs(1);
@@ -19,23 +20,46 @@ const BLOB_MERGE_GAP: i32 = 2;
 const CELL_SIZE: usize = 8;
 const CELLS_X: usize = IMG_WIDTH / CELL_SIZE; // 80
 const CELLS_Y: usize = IMG_HEIGHT / CELL_SIZE; // 45
+const N_CELLS: usize = CELLS_X * CELLS_Y;
 
 // Tuning — detection
-const SPATIAL_THRESHOLD: f32 = 5.0; // spatial MAD z-score threshold (per-frame)
-const TEMPORAL_THRESHOLD: f32 = 4.0; // temporal mean/stddev z-score threshold (per-cell EMA)
+const SPATIAL_THRESHOLD: f32 = 6.0; // spatial MAD z-score threshold (per-frame)
+const TEMPORAL_THRESHOLD: f32 = 5.0; // temporal mean/stddev z-score threshold (per-cell EMA)
+const MIN_CELL_DELTA: f32 = 6.0; // absolute floor: cell mean-diff must exceed frame median by this (counts)
 const EMA_ALPHA: f32 = 0.05; // EMA decay (time constant ≈ 20 frames)
+const EMA_CLAMP_SIGMA: f32 = 3.0; // winsorize EMA updates at ±kσ so events don't poison stats
+const WARMUP_FRAMES: u32 = 3; // frames to settle stats after (re)start before detecting
+
+// Blob sanity: reject blobs covering a huge fraction of the frame
+// (lightning, cloud edges, illumination changes)
+const MAX_BLOB_CELLS: i32 = (N_CELLS / 8) as i32;
 
 // Stacking
-const LUMA_PREBUF: usize = 5; // pre-detection luma frames to keep (for stack init)
+// Must cover SHORT_MAX_FRAMES + (TRACK_MAX_MISSED + 1) retirement lag so the
+// meteor frames are still in the ring when a short track is post-mortemed.
+const LUMA_PREBUF: usize = 8; // pre-detection luma frames to keep (for stack init)
 const STACK_TIMEOUT: u32 = 15; // frames after last detection before saving stack
-const SAVE_BASE: &str = "/media/mmc/detections";
+
+// Tuning — short-meteor (streak) path. Tracks that die unconfirmed within
+// SHORT_MAX_FRAMES are judged by single-frame streak morphology instead of
+// trajectory: a meteor smears into a line within one exposure, while star
+// twinkle / hot pixels / cosmic-ray hits / aircraft strobes stay point-like.
+const SHORT_MAX_FRAMES: usize = 3; // history length considered "short"
+const STREAK_DIFF_THRESHOLD: u8 = 10; // pixel diff floor inside blob ROI
+const STREAK_MIN_ELONG: f32 = 6.0; // pixel-level λ1/λ2 to accept a streak
+const STREAK_MIN_LEN_PX: f32 = 16.0; // full-extent length floor (≈ 2 cells)
+const STREAK_MIN_FLUX: u64 = 300; // sum of diff≥threshold px; rejects faint noise/hot-pixel lines
 
 // Tuning — tracker
-const TRACK_MAX_DIST: f32 = 5.0; // max centroid distance to associate blob to track (cells)
+const TRACK_MAX_DIST: f32 = 5.0; // max residual distance to predicted position (cells)
 const TRACK_MAX_MISSED: u32 = 2; // drop track after this many consecutive missed frames
 const TRACK_MIN_FRAMES: usize = 4; // minimum history length to attempt confirmation
 const TRACK_MIN_DISP_SQ: f32 = 4.0; // minimum displacement² (cells²) to confirm
-const TRACK_MIN_LINEARITY: f32 = 8.0; // λ1/λ2 eigenvalue ratio for linear motion
+const TRACK_MIN_LINEARITY: f32 = 12.0; // λ1/λ2 eigenvalue ratio for linear motion
+const TRACK_MAX_HISTORY: usize = 64; // sliding window cap on centroid history
+const TRACK_MAX_EVENT_FRAMES: u32 = 75; // ~3s @ 25fps — longer-lived = aircraft/satellite
+const TRACK_MIN_MONOTONIC: f32 = 0.8; // fraction of steps advancing along the principal axis
+const TRACK_MIN_SPEED_CELLS: f32 = 0.0625; // 0.5 px/frame — slower = satellite/aircraft
 
 // ============================================================
 // Blob
@@ -199,10 +223,9 @@ fn merge_blobs(blobs: &[Blob]) -> Vec<Blob> {
 }
 
 // ============================================================
-// Spatial MAD z-score (histogram-based, O(n))
+// PNG encoder (uncompressed deflate)
 // ============================================================
 
-/// Returns (median, MAD) of a u8 slice using histogram method.
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFFFFFFu32;
     for &b in data {
@@ -286,13 +309,71 @@ fn save_png(data: &[u8], width: usize, height: usize, path: &str) -> std::io::Re
     std::fs::write(path, encode_png_gray(data, width, height))
 }
 
-fn median_mad(data: &[u8]) -> (u8, u8) {
+/// Save the brightest stack off-thread so flash I/O never stalls the
+/// detection loop. Detections are rare, so the one-off clone + thread
+/// spawn cost is negligible.
+fn spawn_save_stack(stack: Vec<u8>, ts_dir: String, debug_tx: broadcast::Sender<String>) {
+    std::thread::spawn(move || {
+        let path = format!("{}/{}/stack.png", paths::DETECTIONS_DIR, ts_dir);
+        match save_png(&stack, IMG_WIDTH, IMG_HEIGHT, &path) {
+            Err(e) => log::error!("failed to save stack: {}", e),
+            Ok(()) => {
+                log::info!("saved detection stack: {}", path);
+                let msg = format!(
+                    r#"{{"type":"meteor_stack","path":"{}","ts":"{}"}}"#,
+                    path,
+                    ts_dir.replace('/', "")
+                );
+                let _ = debug_tx.send(msg);
+            }
+        }
+    });
+}
+
+/// Max-blend the pre-detection ring buffer into a freshly zeroed stack.
+fn init_stack_from_ring(
+    stack_data: &mut [u8],
+    luma_ring: &[u8],
+    ring_full: bool,
+    ring_idx: usize,
+    frame_size: usize,
+) {
+    stack_data.fill(0);
+    let slots = if ring_full { LUMA_PREBUF } else { ring_idx };
+    for i in 0..slots {
+        let buf = &luma_ring[i * frame_size..(i + 1) * frame_size];
+        unsafe {
+            brightest(
+                buf.as_ptr(),
+                stack_data.as_ptr(),
+                stack_data.as_mut_ptr(),
+                frame_size,
+            );
+        }
+    }
+}
+
+// ============================================================
+// Spatial MAD z-score (histogram-based, O(n))
+// ============================================================
+
+/// Returns (median, MAD) of the unmasked cells of a u8 slice using the
+/// histogram method. Masked cells (wind-blown trees, building edges) would
+/// otherwise inflate the MAD and desensitize the whole frame.
+fn median_mad(data: &[u8], mask: &[u8]) -> (u8, u8) {
     let mut hist = [0u32; 256];
-    for &v in data {
-        hist[v as usize] += 1;
+    let mut count = 0usize;
+    for (&v, &m) in data.iter().zip(mask) {
+        if m == 0 {
+            hist[v as usize] += 1;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return (0, 0);
     }
 
-    let mid = data.len() / 2;
+    let mid = count / 2;
 
     let mut sum = 0usize;
     let mut median = 0u8;
@@ -305,9 +386,11 @@ fn median_mad(data: &[u8]) -> (u8, u8) {
     }
 
     let mut hist_dev = [0u32; 256];
-    for &v in data {
-        let d = (v as i16 - median as i16).unsigned_abs() as usize;
-        hist_dev[d] += 1;
+    for (&v, &m) in data.iter().zip(mask) {
+        if m == 0 {
+            let d = (v as i16 - median as i16).unsigned_abs() as usize;
+            hist_dev[d] += 1;
+        }
     }
 
     let mut sum = 0usize;
@@ -324,25 +407,112 @@ fn median_mad(data: &[u8]) -> (u8, u8) {
 }
 
 // ============================================================
+// Streak morphology (pixel-level, per-blob ROI)
+// ============================================================
+
+#[derive(Copy, Clone, Default)]
+struct StreakStats {
+    flux: u64,       // sum of diff values above threshold
+    cx: f32,         // intensity-weighted centroid, px
+    cy: f32,
+    elongation: f32, // λ1/λ2 of the 2nd-moment covariance
+    length: f32,     // full-extent estimate √(12·λ1), px
+    ux: f32,         // principal axis unit vector
+    uy: f32,
+}
+
+/// Intensity-weighted second moments of the saturating diff (cur − prev)
+/// inside the blob's pixel ROI (blob is in cell coords; padded by one cell).
+/// Raw moments accumulate in u64 (exact); covariance/eigen in f64.
+/// Cost: scalar over a ~32×32 px ROI, only on frames that produced blobs —
+/// negligible, no SIMD needed.
+fn streak_stats(cur: &[u8], prev: &[u8], blob: &Blob) -> StreakStats {
+    let x0 = (blob.x.max(0) as usize * CELL_SIZE).saturating_sub(CELL_SIZE);
+    let y0 = (blob.y.max(0) as usize * CELL_SIZE).saturating_sub(CELL_SIZE);
+    let x1 = (((blob.x + blob.width) as usize + 1) * CELL_SIZE).min(IMG_WIDTH);
+    let y1 = (((blob.y + blob.height) as usize + 1) * CELL_SIZE).min(IMG_HEIGHT);
+
+    let (mut m00, mut m10, mut m01) = (0u64, 0u64, 0u64);
+    let (mut m20, mut m11, mut m02) = (0u64, 0u64, 0u64);
+    for y in y0..y1 {
+        let row_c = &cur[y * IMG_WIDTH..y * IMG_WIDTH + IMG_WIDTH];
+        let row_p = &prev[y * IMG_WIDTH..y * IMG_WIDTH + IMG_WIDTH];
+        for x in x0..x1 {
+            let w = row_c[x].saturating_sub(row_p[x]);
+            if w >= STREAK_DIFF_THRESHOLD {
+                let w = w as u64;
+                m00 += w;
+                m10 += w * x as u64;
+                m01 += w * y as u64;
+                m20 += w * (x * x) as u64;
+                m11 += w * (x * y) as u64;
+                m02 += w * (y * y) as u64;
+            }
+        }
+    }
+    if m00 == 0 {
+        return StreakStats::default();
+    }
+
+    let m00f = m00 as f64;
+    let cx = m10 as f64 / m00f;
+    let cy = m01 as f64 / m00f;
+    let sxx = m20 as f64 / m00f - cx * cx;
+    let sxy = m11 as f64 / m00f - cx * cy;
+    let syy = m02 as f64 / m00f - cy * cy;
+
+    let trace = sxx + syy;
+    let det = sxx * syy - sxy * sxy;
+    let disc = ((trace * trace / 4.0) - det).max(0.0).sqrt();
+    let l1 = (trace / 2.0 + disc).max(0.0);
+    // λ2 floor of (0.5 px)² keeps the ratio finite for 1-px features;
+    // those are rejected by the length gate anyway.
+    let l2 = (trace / 2.0 - disc).max(0.0625);
+
+    let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+
+    StreakStats {
+        flux: m00,
+        cx: cx as f32,
+        cy: cy as f32,
+        elongation: (l1 / l2) as f32,
+        // Uniform line segment of length L has axial variance L²/12.
+        length: (12.0 * l1).sqrt() as f32,
+        ux: theta.cos() as f32,
+        uy: theta.sin() as f32,
+    }
+}
+
+// ============================================================
 // Tracker
 // ============================================================
 
+struct TrackMetrics {
+    linearity: f32, // λ1/λ2 of the centroid-history covariance
+    monotonic: f32, // fraction of steps advancing along the principal axis
+    speed: f32,     // mean speed over the history window, cells/frame
+}
+
 struct Track {
     id: u32,
-    history: Vec<(f32, f32)>, // centroid history in cell coords
+    history: Vec<(f32, f32)>, // centroid history in cell coords (sliding window)
     missed: u32,
     confirmed: bool,
+    rejected: bool, // demoted (aircraft/satellite) — never re-confirms
     first_frame: u32,
+    best_streak: StreakStats, // stats from the brightest (max-flux) frame
 }
 
 impl Track {
-    fn new(id: u32, cx: f32, cy: f32, frame: u32) -> Self {
+    fn new(id: u32, cx: f32, cy: f32, frame: u32, streak: StreakStats) -> Self {
         Self {
             id,
             history: vec![(cx, cy)],
             missed: 0,
             confirmed: false,
+            rejected: false,
             first_frame: frame,
+            best_streak: streak,
         }
     }
 
@@ -350,15 +520,38 @@ impl Track {
         *self.history.last().unwrap()
     }
 
-    /// PCA on centroid history. Returns Some(linearity) if displacement and
-    /// history length are sufficient.
-    fn linearity(&self) -> Option<f32> {
+    /// Constant-velocity extrapolation from the last two points.
+    /// Falls back to the last position for single-point tracks.
+    fn predicted(&self) -> (f32, f32) {
+        let n = self.history.len();
+        if n >= 2 {
+            let (x1, y1) = self.history[n - 1];
+            let (x0, y0) = self.history[n - 2];
+            (2.0 * x1 - x0, 2.0 * y1 - y0)
+        } else {
+            self.last()
+        }
+    }
+
+    /// Append a centroid, capping history to a sliding window so long-lived
+    /// tracks (aircraft, satellites) don't grow unboundedly and the PCA in
+    /// linearity() stays O(TRACK_MAX_HISTORY).
+    fn push(&mut self, p: (f32, f32)) {
+        if self.history.len() >= TRACK_MAX_HISTORY {
+            self.history.remove(0);
+        }
+        self.history.push(p);
+    }
+
+    /// PCA on centroid history plus motion-consistency metrics. Returns
+    /// None if displacement or history length are insufficient.
+    fn metrics(&self) -> Option<TrackMetrics> {
         let n = self.history.len();
         if n < TRACK_MIN_FRAMES {
             return None;
         }
 
-        // Check total displacement
+        // Check total displacement (within the sliding window)
         let (x0, y0) = self.history[0];
         let (x1, y1) = self.last();
         let disp_sq = (x1 - x0).powi(2) + (y1 - y0).powi(2);
@@ -387,16 +580,44 @@ impl Track {
         let lambda1 = trace / 2.0 + disc;
         let lambda2 = (trace / 2.0 - disc).max(1e-6);
 
-        Some(lambda1 / lambda2)
+        // Per-step progression along the principal axis. A source blinking
+        // between two spots is perfectly linear but not monotonic; meteors
+        // advance in one direction. Small negative steps (-0.05 cells) are
+        // tolerated as centroid jitter.
+        let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let (ux, uy) = (theta.cos(), theta.sin());
+        let proj = |p: &(f32, f32)| (p.0 - cx) * ux + (p.1 - cy) * uy;
+        let dir = if proj(&self.history[n - 1]) >= proj(&self.history[0]) {
+            1.0
+        } else {
+            -1.0
+        };
+        let forward = self
+            .history
+            .windows(2)
+            .filter(|w| (proj(&w[1]) - proj(&w[0])) * dir > -0.05)
+            .count();
+
+        Some(TrackMetrics {
+            linearity: lambda1 / lambda2,
+            monotonic: forward as f32 / (n - 1) as f32,
+            speed: disp_sq.sqrt() / (n - 1) as f32,
+        })
     }
 
     fn is_confirmed(&self) -> bool {
-        self.linearity().is_some_and(|l| l >= TRACK_MIN_LINEARITY)
+        !self.rejected
+            && self.metrics().is_some_and(|m| {
+                m.linearity >= TRACK_MIN_LINEARITY
+                    && m.monotonic >= TRACK_MIN_MONOTONIC
+                    && m.speed >= TRACK_MIN_SPEED_CELLS
+            })
     }
 }
 
-/// Greedy nearest-neighbour association. Returns matched (track_idx, centroid_idx) pairs,
-/// plus unmatched centroid indices.
+/// Greedy nearest-neighbour association against velocity-predicted positions.
+/// The gate widens with consecutive misses to tolerate brief dropouts.
+/// Returns matched (track_idx, centroid_idx) pairs, plus unmatched centroid indices.
 fn associate(tracks: &[Track], centroids: &[(f32, f32)]) -> (Vec<(usize, usize)>, Vec<usize>) {
     let mut matched: Vec<(usize, usize)> = Vec::new();
     let mut used_c = vec![false; centroids.len()];
@@ -405,10 +626,12 @@ fn associate(tracks: &[Track], centroids: &[(f32, f32)]) -> (Vec<(usize, usize)>
     // Build (dist², track_idx, centroid_idx) candidates
     let mut candidates: Vec<(f32, usize, usize)> = Vec::new();
     for (ti, track) in tracks.iter().enumerate() {
-        let (tx, ty) = track.last();
+        let (tx, ty) = track.predicted();
+        let gate = TRACK_MAX_DIST * (1.0 + track.missed as f32);
+        let gate_sq = gate * gate;
         for (ci, &(cx, cy)) in centroids.iter().enumerate() {
             let d = (cx - tx).powi(2) + (cy - ty).powi(2);
-            if d <= TRACK_MAX_DIST * TRACK_MAX_DIST {
+            if d <= gate_sq {
                 candidates.push((d, ti, ci));
             }
         }
@@ -444,12 +667,14 @@ pub fn detection_task(
     let handle = tokio::runtime::Handle::current();
     let frame_size = IMG_WIDTH * IMG_HEIGHT;
 
-    let mut prev_frame = vec![0u8; frame_size];
-    let mut diff_frame = vec![0u8; frame_size];
-    let mut cell_map = vec![0u8; CELLS_X * CELLS_Y];
-    let mut cell_visited = vec![0u8; CELLS_X * CELLS_Y];
-    let mut cell_mean = vec![0f32; CELLS_X * CELLS_Y];
-    let mut cell_var = vec![1f32; CELLS_X * CELLS_Y];
+    // Previous frame is held by reference to the channel's LumaFrame —
+    // no per-frame 225KB copy into a prev buffer.
+    let mut prev_luma: Option<luma::LumaFrame> = None;
+    let mut cell_map = vec![0u8; N_CELLS];
+    let mut cell_visited = vec![0u8; N_CELLS];
+    let mut cell_mean = vec![0f32; N_CELLS];
+    let mut cell_var = vec![1f32; N_CELLS];
+    let mut warmup: u32 = WARMUP_FRAMES;
     let mut tracks: Vec<Track> = Vec::new();
     let mut next_track_id: u32 = 0;
     // Pre-allocated ring buffer for pre-detection luma frames (no per-frame alloc)
@@ -474,10 +699,29 @@ pub fn detection_task(
 
         wd.tick();
 
-        if !app_state.load().detection_enabled {
+        let s = app_state.load();
+        let now_local = chrono::Local::now();
+        if !s.detection_enabled
+            || !schedule_active(now_local, s.detection_use_twilight, s.detection_twilight_astro, s.detection_start_hour, s.detection_end_hour, s.latitude, s.longitude)
+        {
+            detection_active.store(false, Ordering::Relaxed);
+            detection_tracking.store(false, Ordering::Relaxed);
+            // Flush any in-progress stack so a detection right at schedule
+            // end isn't lost, then reset state so resume starts clean
+            // (a stale prev frame would otherwise fire the whole frame).
+            if stack_active {
+                spawn_save_stack(stack_data.clone(), stack_ts.clone(), debug_tx.clone());
+                stack_active = false;
+            }
+            tracks.clear();
+            prev_luma = None;
+            luma_ring_idx = 0;
+            luma_ring_full = false;
+            warmup = WARMUP_FRAMES;
             std::thread::sleep(INTERVAL);
             continue;
         }
+        drop(s);
 
         if handle.block_on(luma_rx.changed()).is_err() {
             break;
@@ -495,228 +739,399 @@ pub fn detection_task(
             luma_ring_full = true;
         }
 
+        // First frame after (re)start: prime prev and wait for the next one.
+        let Some(prev) = prev_luma.as_ref() else {
+            prev_luma = Some(luma);
+            continue;
+        };
+
         let t = std::time::Instant::now();
         let mask_snap = mask.load();
 
+        // Fused saturating-subtract + 8×8 binning (single pass over both
+        // frames, no intermediate diff buffer).
         unsafe {
-            let frame = luma.data.as_ptr();
-            let diff_ptr = diff_frame.as_mut_ptr();
-            sub_saturate(frame, prev_frame.as_ptr(), diff_ptr, frame_size);
+            sub_bin_8x8(
+                luma.data.as_ptr(),
+                prev.data.as_ptr(),
+                IMG_WIDTH,
+                IMG_HEIGHT,
+                cell_map.as_mut_ptr(),
+            );
+        }
 
-            // Bin to 80×45 cell map
-            let cell_ptr = cell_map.as_mut_ptr();
-            bin_8x8(diff_ptr as *const u8, IMG_WIDTH, IMG_HEIGHT, cell_ptr);
+        // Warmup: seed temporal stats, no detection yet. Covers both initial
+        // startup and resume after a schedule pause.
+        if warmup > 0 {
+            for i in 0..N_CELLS {
+                cell_mean[i] = cell_map[i] as f32;
+                cell_var[i] = 1.0;
+            }
+            warmup -= 1;
+            prev_luma = Some(luma);
+            frame_index = frame_index.wrapping_add(1);
+            continue;
+        }
 
-            // Spatial MAD z-score
-            let (median, mad) = median_mad(&cell_map);
-            let median_f = median as f32;
-            let sigma_s = mad as f32 * 1.4826; // MAD → σ
+        // Spatial MAD z-score (masked cells excluded from the statistics)
+        let (median, mad) = median_mad(&cell_map, &mask_snap);
+        let median_f = median as f32;
+        let sigma_s = (mad as f32 * 1.4826).max(1.0); // MAD → σ, floored
 
-            // Temporal EMA z-score — seed mean on first frame
-            if frame_index == 0 {
-                for i in 0..CELLS_X * CELLS_Y {
-                    cell_mean[i] = cell_map[i] as f32;
-                }
+        let mut max_z_s = 0f32;
+        let mut max_z_t = 0f32;
+        for i in 0..N_CELLS {
+            let v = cell_map[i] as f32;
+
+            let z_s = (v - median_f) / sigma_s;
+
+            let mu = &mut cell_mean[i];
+            let var = &mut cell_var[i];
+            let delta = v - *mu;
+            let sigma_t = var.sqrt().max(1.0);
+            let z_t = delta / sigma_t;
+
+            // Winsorized EMA update: clamp the innovation at ±kσ so a meteor
+            // (or aircraft) passing through a cell doesn't inflate its
+            // mean/variance and desensitize it for the next ~1/α frames.
+            let d = delta.clamp(-EMA_CLAMP_SIGMA * sigma_t, EMA_CLAMP_SIGMA * sigma_t);
+            *mu += EMA_ALPHA * d;
+            *var = (1.0 - EMA_ALPHA) * (*var + EMA_ALPHA * d * d);
+
+            if z_s > max_z_s {
+                max_z_s = z_s;
+            }
+            if z_t > max_z_t {
+                max_z_t = z_t;
             }
 
-            let mut max_z_s = 0f32;
-            let mut max_z_t = 0f32;
-            for i in 0..CELLS_X * CELLS_Y {
-                let v = cell_map[i] as f32;
+            cell_map[i] =
+                if mask_snap[i] == 0
+                    && z_s > SPATIAL_THRESHOLD
+                    && z_t > TEMPORAL_THRESHOLD
+                    && v - median_f >= MIN_CELL_DELTA
+                {
+                    0xff
+                } else {
+                    0
+                };
+        }
 
-                let z_s = (v - median_f) / sigma_s.max(1.0);
+        // Blob detection
+        let cell_blobs = find_bounding_rectangles(&cell_map, &mut cell_visited, CELLS_X, CELLS_Y);
+        // Sanity filter: drop frame-scale blobs (lightning, clouds,
+        // illumination steps) before they can spawn tracks.
+        let merged_cells: Vec<Blob> = merge_blobs(&cell_blobs)
+            .into_iter()
+            .filter(|b| b.width * b.height <= MAX_BLOB_CELLS)
+            .collect();
 
-                let mu = &mut cell_mean[i];
-                let var = &mut cell_var[i];
-                let delta = v - *mu;
-                *mu += EMA_ALPHA * delta;
-                let delta2 = v - *mu;
-                *var = (1.0 - EMA_ALPHA) * (*var + EMA_ALPHA * delta * delta2);
-                let z_t = delta / var.sqrt().max(1.0);
+        // Pixel-level streak morphology per blob (ROI-limited). Also yields
+        // sub-cell centroids, which tightens the trajectory PCA for slow or
+        // short tracks compared to cell-center centroids.
+        let streaks: Vec<StreakStats> = merged_cells
+            .iter()
+            .map(|b| streak_stats(&luma.data, &prev.data, b))
+            .collect();
 
-                if z_s > max_z_s {
-                    max_z_s = z_s;
+        // Centroids of current blobs (cell coords, sub-cell precision)
+        let centroids: Vec<(f32, f32)> = merged_cells
+            .iter()
+            .zip(&streaks)
+            .map(|(b, s)| {
+                if s.flux > 0 {
+                    (s.cx / CELL_SIZE as f32, s.cy / CELL_SIZE as f32)
+                } else {
+                    b.centroid()
                 }
-                if z_t > max_z_t {
-                    max_z_t = z_t;
-                }
+            })
+            .collect();
 
-                cell_map[i] =
-                    if mask_snap[i] == 0 && z_s > SPATIAL_THRESHOLD && z_t > TEMPORAL_THRESHOLD {
-                        0xff
-                    } else {
-                        0
-                    };
+        // Associate blobs to tracks (velocity-predicted gating)
+        let (matched, unmatched_c) = associate(&tracks, &centroids);
+
+        // Update matched tracks
+        let mut matched_track_ids: Vec<bool> = vec![false; tracks.len()];
+        for (ti, ci) in &matched {
+            tracks[*ti].push(centroids[*ci]);
+            tracks[*ti].missed = 0;
+            if streaks[*ci].flux > tracks[*ti].best_streak.flux {
+                tracks[*ti].best_streak = streaks[*ci];
             }
+            matched_track_ids[*ti] = true;
+        }
 
-            // Blob detection
-            let cell_blobs =
-                find_bounding_rectangles(&cell_map, &mut cell_visited, CELLS_X, CELLS_Y);
-            let merged_cells = merge_blobs(&cell_blobs);
-
-            // Centroids of current blobs (cell coords)
-            let centroids: Vec<(f32, f32)> = merged_cells.iter().map(|b| b.centroid()).collect();
-
-            // Associate blobs to tracks
-            let (matched, unmatched_c) = associate(&tracks, &centroids);
-
-            // Update matched tracks
-            let mut matched_track_ids: Vec<bool> = vec![false; tracks.len()];
-            for (ti, ci) in &matched {
-                tracks[*ti].history.push(centroids[*ci]);
-                tracks[*ti].missed = 0;
-                matched_track_ids[*ti] = true;
+        // Increment missed counter for unmatched tracks
+        for (ti, was_matched) in matched_track_ids.iter().enumerate() {
+            if !was_matched {
+                tracks[ti].missed += 1;
             }
+        }
 
-            // Increment missed counter for unmatched tracks
-            for (ti, matched) in matched_track_ids.iter().enumerate() {
-                if !matched {
-                    tracks[ti].missed += 1;
-                }
+        // Spawn new tracks for unmatched centroids
+        for ci in unmatched_c {
+            let (cx, cy) = centroids[ci];
+            tracks.push(Track::new(next_track_id, cx, cy, frame_index, streaks[ci]));
+            next_track_id = next_track_id.wrapping_add(1);
+        }
+
+        // Demote confirmed tracks that outlive the meteor duration cap —
+        // aircraft and satellites are linear too, but last much longer.
+        // Demoted tracks stay in the list as association sinks so their
+        // blobs don't spawn fresh tracks that re-confirm.
+        for tr in tracks.iter_mut() {
+            if tr.confirmed && frame_index.wrapping_sub(tr.first_frame) > TRACK_MAX_EVENT_FRAMES {
+                tr.confirmed = false;
+                tr.rejected = true;
+                log::info!(
+                    "track {} demoted after {} frames (aircraft/satellite)",
+                    tr.id,
+                    frame_index.wrapping_sub(tr.first_frame)
+                );
             }
+        }
 
-            // Spawn new tracks for unmatched centroids
-            for ci in unmatched_c {
-                let (cx, cy) = centroids[ci];
-                tracks.push(Track::new(next_track_id, cx, cy, frame_index));
-                next_track_id = next_track_id.wrapping_add(1);
+        // Check for newly confirmed tracks and send meteor events
+        let mut confirmed_ids: Vec<u32> = Vec::new();
+        let now = chrono::Local::now();
+        let ts = now.format("%Y%m%d_%H%M%S").to_string();
+        let ts_dir = now.format("%Y/%m/%d/%H%M%S").to_string();
+        for tr in tracks.iter_mut() {
+            if tr.rejected {
+                continue;
             }
+            if tr.confirmed {
+                confirmed_ids.push(tr.id);
+                continue;
+            }
+            if tr.is_confirmed() {
+                tr.confirmed = true;
+                confirmed_ids.push(tr.id);
 
-            // Check for newly confirmed tracks and send meteor events
-            let mut confirmed_ids: Vec<u32> = Vec::new();
-            let now = chrono::Local::now();
-            let ts = now.format("%Y%m%d_%H%M%S").to_string();
-            let ts_dir = now.format("%Y/%m/%d/%H%M%S").to_string();
-            for tr in tracks.iter_mut() {
-                if tr.confirmed {
-                    confirmed_ids.push(tr.id);
-                    continue;
-                }
-                if tr.is_confirmed() {
-                    tr.confirmed = true;
-                    confirmed_ids.push(tr.id);
+                let n = tr.history.len();
+                let (x0, y0) = tr.history[0];
+                let (x1, y1) = tr.last();
+                let dist = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                let speed = dist * CELL_SIZE as f32 / n as f32; // px/frame
+                let traj = tr
+                    .history
+                    .iter()
+                    .map(|(x, y)| {
+                        format!("[{:.0},{:.0}]", x * CELL_SIZE as f32, y * CELL_SIZE as f32)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let msg = format!(
+                    r#"{{"type":"meteor","id":{},"speed":{:.2},"frames":{},"first_frame":{},"last_frame":{},"trajectory":[{}],"ts":"{}"}}"#,
+                    tr.id, speed, n, tr.first_frame, frame_index, traj, ts
+                );
+                log::info!(
+                    "meteor confirmed: id={} frames={} speed={:.1}px/frame flux={} elong={:.1} len={:.0}px mzs={:.1} mzt={:.1} med={} mad={}",
+                    tr.id,
+                    n,
+                    speed,
+                    tr.best_streak.flux,
+                    tr.best_streak.elongation,
+                    tr.best_streak.length,
+                    max_z_s,
+                    max_z_t,
+                    median,
+                    mad
+                );
+                let _ = debug_tx.send(msg);
 
-                    let n = tr.history.len();
-                    let (x0, y0) = tr.history[0];
-                    let (x1, y1) = tr.last();
-                    let dist = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
-                    let speed = dist * CELL_SIZE as f32 / n as f32; // px/frame
-                    let traj = tr
-                        .history
-                        .iter()
-                        .map(|(x, y)| {
-                            format!("[{:.0},{:.0}]", x * CELL_SIZE as f32, y * CELL_SIZE as f32)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let msg = format!(
-                        r#"{{"type":"meteor","id":{},"speed":{:.2},"frames":{},"first_frame":{},"last_frame":{},"trajectory":[{}],"ts":"{}"}}"#,
-                        tr.id, speed, n, tr.first_frame, frame_index, traj, ts
+                // Initialize brightest stack from pre-detection ring buffer
+                if !stack_active {
+                    init_stack_from_ring(
+                        &mut stack_data,
+                        &luma_ring,
+                        luma_ring_full,
+                        luma_ring_idx,
+                        frame_size,
                     );
-                    log::info!(
-                        "meteor confirmed: id={} frames={} speed={:.1}px/frame",
-                        tr.id,
-                        n,
-                        speed
-                    );
-                    let _ = debug_tx.send(msg);
-
-                    // Initialize brightest stack from pre-detection ring buffer
-                    if !stack_active {
-                        stack_data.fill(0);
-                        let slots = if luma_ring_full {
-                            LUMA_PREBUF
-                        } else {
-                            luma_ring_idx
-                        };
-                        for i in 0..slots {
-                            let buf = &luma_ring[i * frame_size..(i + 1) * frame_size];
-                            brightest(
-                                buf.as_ptr(),
-                                stack_data.as_ptr(),
-                                stack_data.as_mut_ptr(),
-                                frame_size,
-                            );
-                        }
-                        stack_active = true;
-                        stack_ts = ts_dir.clone();
-                        stack_countdown = STACK_TIMEOUT;
-                    }
+                    stack_active = true;
+                    stack_ts = ts_dir.clone();
+                    stack_countdown = STACK_TIMEOUT;
                 }
             }
+        }
 
-            // While stacking: max-blend current luma, tick countdown
-            if stack_active {
+        // While stacking: max-blend current luma, tick countdown
+        if stack_active {
+            unsafe {
                 brightest(
-                    frame,
+                    luma.data.as_ptr(),
                     stack_data.as_ptr(),
                     stack_data.as_mut_ptr(),
                     frame_size,
                 );
-                if tracks.iter().any(|tr| tr.confirmed && tr.missed == 0) {
-                    stack_countdown = STACK_TIMEOUT;
-                } else {
-                    stack_countdown -= 1;
-                }
-                if stack_countdown == 0 {
-                    let path = format!("{}/{}/stack.png", SAVE_BASE, stack_ts);
-                    if let Err(e) = save_png(&stack_data, IMG_WIDTH, IMG_HEIGHT, &path) {
-                        log::error!("failed to save stack: {}", e);
-                    } else {
-                        log::info!("saved detection stack: {}", path);
-                        let msg = format!(
-                            r#"{{"type":"meteor_stack","path":"{}","ts":"{}"}}"#,
-                            path, stack_ts.replace('/', "")
-                        );
-                        let _ = debug_tx.send(msg);
-                    }
-                    stack_active = false;
-                }
             }
+            if tracks.iter().any(|tr| tr.confirmed && tr.missed == 0) {
+                stack_countdown = STACK_TIMEOUT;
+            } else {
+                stack_countdown = stack_countdown.saturating_sub(1);
+            }
+            if stack_countdown == 0 {
+                spawn_save_stack(stack_data.clone(), stack_ts.clone(), debug_tx.clone());
+                stack_active = false;
+            }
+        }
 
-            tracks.retain(|tr| tr.missed <= TRACK_MAX_MISSED);
-
-            // Signal recording task
-            detection_tracking.store(!tracks.is_empty(), Ordering::Relaxed);
-            let has_active = tracks.iter().any(|tr| tr.confirmed);
-            detection_active.store(has_active, Ordering::Relaxed);
-
-            // Send DetectionDebug JSON
-            if debug_tx.receiver_count() > 0 {
-                let b_json = merged_cells
+        // Retire stale tracks. Short unconfirmed tracks (too few frames for
+        // trajectory confirmation) get a post-mortem streak-morphology check:
+        // a meteor smears into a line within a single exposure, so elongation
+        // + length discriminate it from twinkle / hot pixels / strobes even
+        // when the track never reached TRACK_MIN_FRAMES.
+        let mut ti = 0;
+        while ti < tracks.len() {
+            if tracks[ti].missed <= TRACK_MAX_MISSED {
+                ti += 1;
+                continue;
+            }
+            let tr = tracks.swap_remove(ti);
+            if tr.rejected {
+                continue;
+            }
+            if tr.confirmed {
+                // Final event with the full trajectory — the confirmation-time
+                // event only carried the first few points.
+                let n = tr.history.len();
+                let (x0, y0) = tr.history[0];
+                let (x1, y1) = tr.last();
+                let dist = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                let speed = dist * CELL_SIZE as f32 / n as f32;
+                let traj = tr
+                    .history
                     .iter()
-                    .map(|b| format!("[{},{},{},{}]", b.x, b.y, b.width, b.height))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                // tracks: [id, cx_px, cy_px, frame_count]
-                let t_json = tracks
-                    .iter()
-                    .map(|tr| {
-                        let (cx, cy) = tr.last();
-                        format!(
-                            "[{},{:.0},{:.0},{}]",
-                            tr.id,
-                            cx * CELL_SIZE as f32,
-                            cy * CELL_SIZE as f32,
-                            tr.history.len()
-                        )
+                    .map(|(x, y)| {
+                        format!("[{:.0},{:.0}]", x * CELL_SIZE as f32, y * CELL_SIZE as f32)
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                let c_json = confirmed_ids
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
                 let msg = format!(
-                    r#"{{"type":"det","f":{},"b":[{}],"l":[],"t":[{}],"c":[{}],"mzs":{:.2},"mzt":{:.2}}}"#,
-                    frame_index, b_json, t_json, c_json, max_z_s, max_z_t
+                    r#"{{"type":"meteor_end","id":{},"speed":{:.2},"frames":{},"first_frame":{},"last_frame":{},"trajectory":[{}],"ts":"{}"}}"#,
+                    tr.id, speed, n, tr.first_frame, frame_index, traj, ts
                 );
                 let _ = debug_tx.send(msg);
+                continue;
+            }
+            if tr.history.len() > SHORT_MAX_FRAMES {
+                continue;
+            }
+            let s = tr.best_streak;
+            if s.flux < STREAK_MIN_FLUX || s.elongation < STREAK_MIN_ELONG || s.length < STREAK_MIN_LEN_PX {
+                continue;
             }
 
-            std::ptr::copy_nonoverlapping(frame, prev_frame.as_mut_ptr(), frame_size);
+            // Trajectory from the streak's principal axis (px endpoints).
+            let half = s.length / 2.0;
+            let (ax0, ay0) = (s.cx - s.ux * half, s.cy - s.uy * half);
+            let (ax1, ay1) = (s.cx + s.ux * half, s.cy + s.uy * half);
+            let n = tr.history.len();
+            let msg = format!(
+                r#"{{"type":"meteor","id":{},"speed":{:.2},"frames":{},"first_frame":{},"last_frame":{},"trajectory":[[{:.0},{:.0}],[{:.0},{:.0}]],"ts":"{}","short":true,"elongation":{:.1},"length":{:.1}}}"#,
+                tr.id,
+                s.length / n as f32, // lower bound: streak length over visible frames
+                n,
+                tr.first_frame,
+                tr.first_frame + (n as u32 - 1),
+                ax0,
+                ay0,
+                ax1,
+                ay1,
+                ts,
+                s.elongation,
+                s.length
+            );
+            log::info!(
+                "short meteor: id={} frames={} len={:.0}px elong={:.1} flux={}",
+                tr.id,
+                n,
+                s.length,
+                s.elongation,
+                s.flux
+            );
+            let _ = debug_tx.send(msg);
+
+            // Ring depth (LUMA_PREBUF=8) still covers the meteor frames at
+            // retirement time, so the stack init captures the event itself.
+            if !stack_active {
+                init_stack_from_ring(
+                    &mut stack_data,
+                    &luma_ring,
+                    luma_ring_full,
+                    luma_ring_idx,
+                    frame_size,
+                );
+                stack_active = true;
+                stack_ts = ts_dir.clone();
+                stack_countdown = STACK_TIMEOUT;
+            }
         }
+
+        // Signal recording task. detection_active now also covers the
+        // stacking window: short meteors are only recognized at retirement
+        // (after the event ended), so without this the recorder would never
+        // see them; for confirmed meteors it extends the clip by up to
+        // STACK_TIMEOUT frames of trailing context.
+        detection_tracking.store(!tracks.is_empty(), Ordering::Relaxed);
+        let has_active = tracks.iter().any(|tr| tr.confirmed) || stack_active;
+        detection_active.store(has_active, Ordering::Relaxed);
+
+        // Send DetectionDebug JSON
+        if debug_tx.receiver_count() > 0 {
+            let b_json = merged_cells
+                .iter()
+                .map(|b| format!("[{},{},{},{}]", b.x, b.y, b.width, b.height))
+                .collect::<Vec<_>>()
+                .join(",");
+            // tracks: [id, cx_px, cy_px, frame_count]
+            let t_json = tracks
+                .iter()
+                .map(|tr| {
+                    let (cx, cy) = tr.last();
+                    format!(
+                        "[{},{:.0},{:.0},{}]",
+                        tr.id,
+                        cx * CELL_SIZE as f32,
+                        cy * CELL_SIZE as f32,
+                        tr.history.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let c_json = confirmed_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            // Streak principal-axis segments (px) for blobs that look line-like
+            let l_json = streaks
+                .iter()
+                .filter(|s| {
+                    s.flux >= STREAK_MIN_FLUX && s.elongation >= STREAK_MIN_ELONG && s.length >= STREAK_MIN_LEN_PX
+                })
+                .map(|s| {
+                    let half = s.length / 2.0;
+                    format!(
+                        "[{:.0},{:.0},{:.0},{:.0}]",
+                        s.cx - s.ux * half,
+                        s.cy - s.uy * half,
+                        s.cx + s.ux * half,
+                        s.cy + s.uy * half
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let msg = format!(
+                r#"{{"type":"det","f":{},"b":[{}],"l":[{}],"t":[{}],"c":[{}],"mzs":{:.2},"mzt":{:.2}}}"#,
+                frame_index, b_json, l_json, t_json, c_json, max_z_s, max_z_t
+            );
+            let _ = debug_tx.send(msg);
+        }
+
+        // Current frame becomes prev — a move, not a 225KB copy.
+        prev_luma = Some(luma);
 
         elapsed_acc += t.elapsed().as_micros() as u64;
         frame_index = frame_index.wrapping_add(1);

@@ -1,4 +1,4 @@
-import type { AppState, SysStat, IspStat, DetectionDebug, MeteorEvent } from './types';
+import type { AppState, SysStat, IspStat, DetectionDebug, MeteorEvent, FfSavedEvent, StarsEvent, SolverStatus } from './types';
 
 export class AtometWebSocket {
 	private ws: WebSocket | null = null;
@@ -8,6 +8,11 @@ export class AtometWebSocket {
 	onIspStat: ((stat: IspStat) => void) | null = null;
 	onDetectionDebug: ((debug: DetectionDebug) => void) | null = null;
 	onMeteorEvent: ((event: MeteorEvent) => void) | null = null;
+	onMeteorEnd: ((event: MeteorEvent) => void) | null = null;
+	onFfSaved: ((event: FfSavedEvent) => void) | null = null;
+	onStars: ((event: StarsEvent) => void) | null = null;
+	onSolverStatus: ((status: SolverStatus) => void) | null = null;
+	onBypass: ((bits: number[]) => void) | null = null;
 	onBinary: ((data: Uint8Array) => void) | null = null;
 	onStatusChange: ((connected: boolean) => void) | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -47,6 +52,16 @@ export class AtometWebSocket {
 						this.onDetectionDebug?.(msg as DetectionDebug);
 					} else if (msg.type === 'meteor') {
 						this.onMeteorEvent?.(msg as MeteorEvent);
+					} else if (msg.type === 'meteor_end') {
+						this.onMeteorEnd?.(msg as MeteorEvent);
+					} else if (msg.type === 'ff_saved') {
+						this.onFfSaved?.(msg as FfSavedEvent);
+					} else if (msg.type === 'stars') {
+						this.onStars?.(msg as StarsEvent);
+					} else if (msg.type === 'solver_status') {
+						this.onSolverStatus?.(msg as SolverStatus);
+					} else if (msg.type === 'bypass') {
+						this.onBypass?.(msg.bits as number[]);
 					}
 				} catch {
 					// ignore parse errors

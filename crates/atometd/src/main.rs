@@ -2,17 +2,21 @@ pub mod ae_ctrl;
 mod config;
 mod daynight;
 mod detection;
+mod ff;
+mod fits;
 mod font;
 mod gpio;
 mod isp;
 mod luma;
 mod muxer;
 mod osd;
+mod paths;
 mod record;
 mod solve;
 mod stream;
 mod system;
 mod watchdog;
+mod wcs;
 mod web;
 mod webhook;
 mod websocket;
@@ -31,16 +35,19 @@ use std::fs::OpenOptions;
 #[tokio::main]
 async fn main() {
     println!("atometd starting...");
-    // 1. Logger init (console + /media/mmc/atomet.log)
+    // 1. Logger init (console + paths::LOG_FILE)
     // Rotate log if over 1MB
-    const LOG_PATH: &str = "/media/mmc/atomet.log";
     const LOG_MAX_BYTES: u64 = 1024 * 1024;
-    if let Ok(meta) = std::fs::metadata(LOG_PATH)
+    let _ = std::fs::create_dir_all(paths::LOG_DIR);
+    if let Ok(meta) = std::fs::metadata(paths::LOG_FILE)
         && meta.len() > LOG_MAX_BYTES
     {
-        let _ = std::fs::rename(LOG_PATH, "/media/mmc/atomet.log.1");
+        let _ = std::fs::rename(paths::LOG_FILE, paths::LOG_FILE_OLD);
     }
-    let log_file = OpenOptions::new().append(true).create(true).open(LOG_PATH);
+    let log_file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(paths::LOG_FILE);
 
     match log_file {
         Ok(file) => {
@@ -56,10 +63,40 @@ async fn main() {
         }
     }
 
+    // Capture panic info to log + stderr before abort kicks in.
+    // (panic = "abort" otherwise leaves no trace in atomet.log.)
+    // stderr is flushed explicitly because the runtime may exit before
+    // any line buffer drains.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let msg = format!("PANIC: {info}");
+        let _ = writeln!(std::io::stderr(), "{msg}");
+        let _ = std::io::stderr().flush();
+        log::error!("{msg}");
+    }));
+
     log::info!("atometd starting");
 
     // 2. Load config
     let app_state_data = load_config().await;
+    system::apply_timezone(&app_state_data.timezone);
+    // Re-apply persisted ISP bypass bits before any frame is captured.
+    if app_state_data.isp_bypass.len() == 32 {
+        match ae_ctrl::AtometDev::open() {
+            Ok(dev) => {
+                let mut bp = ae_ctrl::TopBypass::default();
+                for (i, &v) in app_state_data.isp_bypass.iter().enumerate() {
+                    bp.bits[i] = v;
+                }
+                if let Err(e) = dev.set_bypass(&bp) {
+                    log::warn!("Failed to apply persisted ISP bypass: {}", e);
+                } else {
+                    log::info!("Applied persisted ISP bypass bits");
+                }
+            }
+            Err(e) => log::warn!("ISP bypass restore skipped (cannot open /dev/atomet): {}", e),
+        }
+    }
     let app_state: SharedAppState = Arc::new(ArcSwap::from_pointee(app_state_data.clone()));
 
     // 3. Hardware watchdog
@@ -98,13 +135,15 @@ async fn main() {
 
         let _ = gpio::led_off(gpio::Led::Orange).await;
 
-        // Apply saved GPIO state
-        if app_state_data.ircut_on {
-            let _ = gpio::ircut_on().await;
-        }
-        if app_state_data.irled_on {
-            let _ = gpio::irled_on().await;
-        }
+        // Apply saved GPIO state explicitly in both directions so persisted
+        // OFF values aren't masked by hardware defaults.
+        let _ = if app_state_data.ircut_on { gpio::ircut_on().await } else { gpio::ircut_off().await };
+        let _ = if app_state_data.irled_on { gpio::irled_on().await } else { gpio::irled_off().await };
+        let _ = if app_state_data.led_on {
+            gpio::led_on(gpio::Led::Blue).await
+        } else {
+            gpio::led_off(gpio::Led::Blue).await
+        };
     }
 
     // 7. ISP init (blocking)
@@ -130,6 +169,18 @@ async fn main() {
             return false;
         }
         log::info!("Framesource started");
+
+        // Disable ISP digital gain (cap to 0 = 1x)
+        match crate::ae_ctrl::AtometDev::open() {
+            Ok(dev) => {
+                /*if let Err(e) = dev.set_max_idg(256) {
+                    log::error!("Failed to disable ISP DG: {}", e);
+                } else {
+                    log::info!("ISP digital gain disabled (max_idg=256)");
+                }*/
+            }
+            Err(e) => log::error!("Failed to open /dev/atomet for DG disable: {}", e),
+        }
 
         true
     })
@@ -219,19 +270,22 @@ async fn main() {
 
     // Load mask (80×45 = 3600 bytes, one byte per cell)
     // Wrapped in ArcSwap so PUT /api/mask can hot-swap at runtime.
-    const MASK_PATH: &str = "/media/mmc/mask.bin";
     const MASK_SIZE: usize = 80 * 45;
     let mask_data: Arc<ArcSwap<Vec<u8>>> =
-        Arc::new(ArcSwap::from_pointee(match std::fs::read(MASK_PATH) {
+        Arc::new(ArcSwap::from_pointee(match std::fs::read(paths::MASK_BIN) {
             Ok(data) if data.len() == MASK_SIZE => {
                 let masked = data.iter().filter(|&&v| v != 0).count();
-                log::info!("Loaded mask from {} ({} cells masked)", MASK_PATH, masked);
+                log::info!(
+                    "Loaded mask from {} ({} cells masked)",
+                    paths::MASK_BIN,
+                    masked
+                );
                 data
             }
             _ => {
                 log::info!(
                     "No mask loaded ({}), detection/solve use full frame",
-                    MASK_PATH
+                    paths::MASK_BIN
                 );
                 vec![0u8; MASK_SIZE]
             }
@@ -261,6 +315,36 @@ async fn main() {
         );
     });
 
+    // FF stacker: 256-frame temporal stack producing maxpixel/maxframe/avepixel/stdpixel.
+    let wd_ff_stack = supervisor.register("ff_stack");
+    let (ff_block_tx, ff_block_rx) = mpsc::channel::<ff::FfBlock>(2);
+    let luma_rx_ff = luma_rx.clone();
+    let shutdown_clone = Arc::clone(&shutdown);
+    tokio::task::spawn_blocking(move || {
+        ff::ff_stack_worker(luma_rx_ff, ff_block_tx, shutdown_clone, wd_ff_stack);
+    });
+
+    // Plate solver database — shared by the FF saver (automatic solve) and
+    // the on-demand /api/solve web handlers.
+    let solver_db = Arc::new(solve::load_database());
+    let latest_stars = Arc::new(arc_swap::ArcSwapOption::<ff::LatestStars>::empty());
+
+    // FF smart saver: saves detected / interesting / baseline blocks.
+    let (ff_event_tx, _) = broadcast::channel::<String>(16);
+    let ff_detection_rx = detection_tx.subscribe();
+    let shutdown_clone = Arc::clone(&shutdown);
+    tokio::spawn(ff::ff_save_smart_task(
+        ff_block_rx,
+        ff_detection_rx,
+        ff_event_tx.clone(),
+        shutdown_clone,
+        Arc::clone(&mask_data),
+        Arc::clone(&solver_db),
+        Arc::clone(&latest_stars),
+        app_state_data.fps,
+        Arc::clone(&app_state),
+    ));
+
     // Webhook notification task
     let (webhook_event_tx, webhook_event_rx) = mpsc::channel::<webhook::WebhookEvent>(32);
     let shutdown_clone = Arc::clone(&shutdown);
@@ -274,7 +358,6 @@ async fn main() {
     let app_state_clone = Arc::clone(&app_state);
     tokio::spawn(daynight::daynight_task(app_state_clone, shutdown_clone));
 
-    let wd_solve = supervisor.register("solve");
 
     // Watchdog supervisor
     let shutdown_clone = Arc::clone(&shutdown);
@@ -297,6 +380,14 @@ async fn main() {
         shutdown_clone,
     ));
 
+    // Scheduled reboot task
+    let app_state_clone = Arc::clone(&app_state);
+    let shutdown_clone = Arc::clone(&shutdown);
+    tokio::spawn(system::scheduled_reboot_task(
+        app_state_clone,
+        shutdown_clone,
+    ));
+
     // 10. Shutdown signal channel — used by both config save and axum graceful shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_clone = Arc::clone(&shutdown);
@@ -314,35 +405,17 @@ async fn main() {
     });
 
     // 11. axum server on port 80
-    let stack_capture = Arc::new(AtomicBool::new(false));
-
-    // Solve task
-    let shutdown_clone = Arc::clone(&shutdown);
-    let app_state_clone = Arc::clone(&app_state);
-    let detection_tx_clone = detection_tx.clone();
-    let luma_rx_solve = luma_rx.clone();
-    let stack_capture_clone = Arc::clone(&stack_capture);
-    let mask_clone = Arc::clone(&mask_data);
-    tokio::task::spawn_blocking(move || {
-        solve::solve_task(
-            luma_rx_solve,
-            app_state_clone,
-            shutdown_clone,
-            wd_solve,
-            detection_tx_clone,
-            stack_capture_clone,
-            mask_clone,
-        );
-    });
-
     let web_state = web::WebState {
         app_state,
         shutdown,
         sysstat_tx,
         detection_tx,
-        stack_capture: Arc::clone(&stack_capture),
+        ff_tx: ff_event_tx,
         mask: Arc::clone(&mask_data),
         webhook_tx: webhook_event_tx,
+        luma_rx: luma_rx.clone(),
+        solver_db,
+        latest_stars,
     };
     let app = web::build_router(web_state);
 

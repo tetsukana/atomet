@@ -216,7 +216,16 @@ unsafe fn imp_osd_toggle_show(show: bool) -> bool {
 ///
 ///
 pub fn osd_poll_loop(app_state: SharedAppState, shutdown: Arc<AtomicBool>) {
-    let mut timestamp_data = vec![0u8; TEXT_BUF_SIZE * (CHAR_WIDTH + 2) * CHAR_HEIGHT];
+    // Double-buffered so the bitmap currently composited into frames is never
+    // modified while the next one is being drawn.
+    let mut timestamp_bufs = [
+        vec![0u8; TEXT_BUF_SIZE * (CHAR_WIDTH + 2) * CHAR_HEIGHT],
+        vec![0u8; TEXT_BUF_SIZE * (CHAR_WIDTH + 2) * CHAR_HEIGHT],
+    ];
+    let mut buf_index = 0;
+
+    let mut last_timestamp_pos: Option<u32> = None;
+    let mut last_show: Option<bool> = None;
 
     if unsafe { !osd_init() } {
         log::error!("OSD init failed");
@@ -231,16 +240,26 @@ pub fn osd_poll_loop(app_state: SharedAppState, shutdown: Arc<AtomicBool>) {
 
         let state = app_state.load();
 
-        if !set_osd_attr(TimestampPos::from_u32(state.timestamp_position)) {
-            log::error!("Failed to update OSD attributes");
-            continue;
+        // Re-setting the region attributes clears the bitmap data until the
+        // next IMP_OSD_UpdateRgnAttrData, so only do it when the position
+        // actually changed to avoid flicker.
+        if last_timestamp_pos != Some(state.timestamp_position) {
+            if set_osd_attr(TimestampPos::from_u32(state.timestamp_position)) {
+                last_timestamp_pos = Some(state.timestamp_position);
+            } else {
+                log::error!("Failed to update OSD attributes");
+            }
         }
 
-        unsafe {
-            imp_osd_toggle_show(state.show_timestamp);
+        if last_show != Some(state.show_timestamp) {
+            if unsafe { imp_osd_toggle_show(state.show_timestamp) } {
+                last_show = Some(state.show_timestamp);
+            }
         }
 
         if state.show_timestamp {
+            buf_index ^= 1;
+            let timestamp_data = &mut timestamp_bufs[buf_index];
             timestamp_data.fill(0);
             let now = chrono::Local::now();
             let fractional_second = (now.timestamp_subsec_millis() as f64) / 100.0;
@@ -253,7 +272,7 @@ pub fn osd_poll_loop(app_state: SharedAppState, shutdown: Arc<AtomicBool>) {
                 VERSION
             );
 
-            osd_update_text(&text, &mut timestamp_data);
+            osd_update_text(&text, timestamp_data);
 
             let mut data = IMPOSDRgnAttrData {
                 bitmapData: timestamp_data.as_mut_ptr() as *mut ::std::os::raw::c_void,

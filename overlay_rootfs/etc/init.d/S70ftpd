@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# Anonymous read-only FTP server for /media/mmc
+# 匿名アクセス、Windows エクスプローラから ftp://<host>/ で読み出し可能
+#
+
+PORT=21
+ROOT=/media/mmc
+
+start() {
+  [ -d "$ROOT" ] || {
+    echo "WARNING: $ROOT not found, FTP not started"
+    return 0
+  }
+  echo "Starting ftpd on port $PORT (root=$ROOT, read-only)..."
+  TCPSVD=$(command -v tcpsvd)
+  [ -n "$TCPSVD" ] || { echo "ERROR: tcpsvd not found"; return 1; }
+  start-stop-daemon -S -b -m -p /var/run/ftpd.pid -x "$TCPSVD" -- \
+    -vE 0.0.0.0 "$PORT" ftpd "$ROOT" >> /var/log/ftpd.log 2>&1
+  echo "OK"
+}
+
+stop() {
+  echo "Stopping ftpd..."
+  start-stop-daemon -K -p /var/run/ftpd.pid 2>/dev/null
+  killall tcpsvd 2>/dev/null || true
+  killall ftpd   2>/dev/null || true
+  rm -f /var/run/ftpd.pid
+  echo "OK"
+}
+
+restart() {
+  stop
+  start
+}
+
+case "$1" in
+  start)   start ;;
+  stop)    stop ;;
+  restart|reload) restart ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac
+
+exit 0

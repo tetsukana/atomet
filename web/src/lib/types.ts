@@ -53,9 +53,14 @@ export interface AppState {
 	timelapse_start_hour: number;
 	timelapse_end_hour: number;
 	detection_record_enabled: boolean;
-	detection_record_start_hour: number;
-	detection_record_end_hour: number;
 	detection_enabled: boolean;
+	detection_start_hour: number;
+	detection_end_hour: number;
+	solver_enabled: boolean;
+	solver_start_hour: number;
+	solver_end_hour: number;
+	solver_use_twilight: boolean;
+	solver_twilight_astro: boolean;
 	auto_daynight: boolean;
 	show_timestamp: boolean;
 	show_watermark: boolean;
@@ -73,6 +78,20 @@ export interface AppState {
 	webhook_notify_startup: boolean;
 	webhook_notify_detection_start: boolean;
 	webhook_notify_detection_end: boolean;
+	timezone: string;
+	latitude: number;
+	longitude: number;
+	record_use_twilight: boolean;
+	timelapse_use_twilight: boolean;
+	detection_use_twilight: boolean;
+	record_twilight_astro: boolean;
+	timelapse_twilight_astro: boolean;
+	detection_twilight_astro: boolean;
+	scheduled_reboot_enabled: boolean;
+	scheduled_reboot_hour: number;
+	auto_ircut: boolean;
+	auto_irled: boolean;
+	isp_bypass: number[];
 }
 
 export interface MeteorEvent {
@@ -83,4 +102,48 @@ export interface MeteorEvent {
 	last_frame: number;
 	trajectory: [number, number][];  // [x,y] in 640×360 px
 	ts: string;           // timestamp string (YYYYMMDD_HHMMSS)
+	short?: boolean;      // single-frame streak detection
+	ff?: boolean;         // FF second-pass (σ-clip line) detection
+}
+
+export interface FfSavedEvent {
+	reason: 'detected' | 'interesting' | 'baseline';
+	ts: string;   // YYYYMMDD_HHMMSS_mmm
+	path: string; // e.g. /files/ff/2024/01/15/12/FF_*.fits
+}
+
+/** Plate solver calibration status, sent once per FF block */
+export interface SolverStatus {
+	enabled: boolean;
+	in_schedule: boolean;
+	has_ref: boolean;          // a reference solution exists
+	age: number | null;        // seconds since it was last verified
+	due: boolean;              // needs (re)calibration / verification
+	samples: number;           // agreeing solves collected so far
+	need: number;              // solves needed for a reference
+	trying: boolean;           // an attempt burst is running
+	retry_in: number | null;   // seconds until the next attempt (backing off)
+	moved: number | null;      // degrees the last reference moved from the previous one
+}
+
+/** Star extraction result from an FF block's mean frame */
+export interface StarsEvent {
+	ts?: string;       // YYYYMMDD_HHMMSS (block start, local time)
+	count: number;     // confirmed stars (re-sighted across blocks; fed to the solver)
+	tentative?: number; // seen too few times so far
+	rejected?: number; // static sources (hot pixels / persistent false positives)
+	threshold?: number;
+	// Automatic plate solve of the confirmed stars; null = no solution / too few stars
+	// matched/outer/rms: catalog stars matched after lens calibration (whole frame /
+	// beyond 30° from the center) and residual RMS in px
+	// lens: radial profile r = f·(θ + c3·θ³ + c5·θ⁵) in px (θ in rad); f·tanθ if c3/c5 are absent
+	solve?: {
+		ra: number; dec: number; roll: number; votes: number;
+		matched: number; outer: number; rms: number;
+		lens?: { f: number; c3?: number; c5?: number };
+		ms: number;
+	} | null;
+	// [x,y,flux,state,hits] — sub-pixel position in 640×360 px;
+	// state: 0 = confirmed, 1 = static (rejected), 2 = tentative
+	stars: number[][];
 }

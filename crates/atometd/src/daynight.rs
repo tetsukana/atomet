@@ -88,18 +88,17 @@ pub async fn daynight_task(app_state: SharedAppState, shutdown: Arc<AtomicBool>)
             let elapsed = last_transition.elapsed().as_secs();
             if elapsed >= MIN_TRANSITION_SECS || mode == Mode::Unknown {
                 let night = target == Mode::Night;
+                let s = app_state.load();
                 log::info!(
-                    "Auto daynight: → {} (brightness={:.1}%, avg={:.1}%)",
+                    "Auto daynight: → {} (brightness={:.1}%, avg={:.1}%, auto_ircut={}, auto_irled={})",
                     if night { "NIGHT" } else { "DAY" },
                     brightness,
-                    avg
+                    avg,
+                    s.auto_ircut,
+                    s.auto_irled
                 );
 
-                if night {
-                    apply_night().await;
-                } else {
-                    apply_day().await;
-                }
+                apply_scene(night, s.auto_ircut, s.auto_irled).await;
 
                 // Reset history so stale samples don't bias the new mode
                 history.fill(if night { 0.0 } else { 100.0 });
@@ -107,8 +106,12 @@ pub async fn daynight_task(app_state: SharedAppState, shutdown: Arc<AtomicBool>)
                 let current = app_state.load_full();
                 let mut updated = (*current).clone();
                 updated.night_mode = night;
-                updated.ircut_on = !night;
-                updated.irled_on = night;
+                if updated.auto_ircut {
+                    updated.ircut_on = !night;
+                }
+                if updated.auto_irled {
+                    updated.irled_on = night;
+                }
                 app_state.store(Arc::new(updated));
 
                 mode = target;
@@ -120,26 +123,38 @@ pub async fn daynight_task(app_state: SharedAppState, shutdown: Arc<AtomicBool>)
     }
 }
 
-/// Day → Night: ircut off → IR LED on → ISP night mode
-pub async fn apply_night() {
-    let _ = gpio::ircut_off().await;
-    let _ = gpio::irled_on().await;
-    tokio::task::spawn_blocking(|| unsafe {
-        IMP_ISP_Tuning_SetISPRunningMode(IMPISPRunningMode_IMPISP_RUNNING_MODE_NIGHT);
-    })
-    .await
-    .ok();
-}
-
-/// Night → Day: ISP day mode first (AE normalises) → IR LED off → ircut on
-pub async fn apply_day() {
-    tokio::task::spawn_blocking(|| unsafe {
-        IMP_ISP_Tuning_SetISPRunningMode(IMPISPRunningMode_IMPISP_RUNNING_MODE_DAY);
-    })
-    .await
-    .ok();
-    let _ = gpio::irled_off().await;
-    let _ = gpio::ircut_on().await;
+/// Apply a day/night transition, honouring per-feature auto flags.
+///
+/// ISP running-mode switch is unconditional (it is the whole point of auto
+/// daynight). IR Cut and IR LED are only touched when the user has them in
+/// Auto mode.
+pub async fn apply_scene(night: bool, auto_ircut: bool, auto_irled: bool) {
+    if night {
+        if auto_ircut {
+            let _ = gpio::ircut_off().await;
+        }
+        if auto_irled {
+            let _ = gpio::irled_on().await;
+        }
+        tokio::task::spawn_blocking(|| unsafe {
+            IMP_ISP_Tuning_SetISPRunningMode(IMPISPRunningMode_IMPISP_RUNNING_MODE_NIGHT);
+        })
+        .await
+        .ok();
+    } else {
+        // Day: ISP day mode first so AE normalises, then ircut on, irled off.
+        tokio::task::spawn_blocking(|| unsafe {
+            IMP_ISP_Tuning_SetISPRunningMode(IMPISPRunningMode_IMPISP_RUNNING_MODE_DAY);
+        })
+        .await
+        .ok();
+        if auto_ircut {
+            let _ = gpio::ircut_on().await;
+        }
+        if auto_irled {
+            let _ = gpio::irled_off().await;
+        }
+    }
 }
 
 /// Read scene brightness (0–100%) via ISP API.

@@ -22,3 +22,8 @@ drivers/sensors-t31/gc2053/Module.symvers
 drivers/sensors-t31/gc2053/modules.order
 drivers/sensors-t31/gc2053/.tmp_versions/
 *.log
+
+# Hipparcos catalog for the solver DB build (large; see buildscripts/post_build.sh)
+data/hip_main.dat
+data/hip_main.dat.gz
+data/hyg.csv

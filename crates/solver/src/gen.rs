@@ -1,7 +1,12 @@
 //! Database generator for the plate solver.
 //!
-//! Reads the Hipparcos catalog (`hip_main.dat`) and generates `database.bin`.
-//! Run on host: `cargo run -p solver --bin gen`
+//! Reads a star catalog and generates `database.bin`. Supported inputs
+//! (chosen by file extension):
+//!   - Hipparcos main catalog `hip_main.dat` (pipe-separated, epoch J1991.25)
+//!   - HYG database `hyg*.csv` (v3 layout, epoch J2000.0; rows without a
+//!     Hipparcos id are skipped)
+//!
+//! Run on host: `cargo run -p solver --bin gen -- generate <catalog>`
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,7 +24,10 @@ const STARS_PER_FOV: usize = 150;
 const DB_LATTICE_N: usize = 100_000;
 const MAX_PATTERNS_PER_CENTER: usize = 50;
 const EPOCH_TARGET: f32 = 2025.0;
-const EPOCH_SOURCE: f32 = 1991.25;
+/// Epoch of the Hipparcos `hip_main.dat` positions.
+const EPOCH_HIP_MAIN: f32 = 1991.25;
+/// Epoch of the HYG database positions.
+const EPOCH_HYG: f32 = 2000.0;
 
 struct FibonacciLattice(usize, usize);
 
@@ -43,9 +51,90 @@ impl Iterator for FibonacciLattice {
     }
 }
 
-fn read_hip_main(reader: BufReader<File>) -> Vec<HipStar> {
-    let delta_t = EPOCH_TARGET - EPOCH_SOURCE;
+/// Apply proper motion (mas/yr) from `epoch_source` to `EPOCH_TARGET`.
+fn propagate(ra_deg: f32, dec_deg: f32, pm_ra: f32, pm_dec: f32, epoch_source: f32) -> Equatorial {
+    let delta_t = EPOCH_TARGET - epoch_source;
+    Equatorial {
+        ra: (ra_deg + (pm_ra * delta_t / 3600000.))
+            .rem_euclid(360.)
+            .to_radians(),
+        dec: (dec_deg + (pm_dec * delta_t / 3600000.)).to_radians(),
+    }
+}
 
+/// Split one CSV line into fields, honouring double-quoted fields (which may
+/// contain commas). Quotes are stripped; `""` inside quotes is a literal `"`.
+fn split_csv(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Read stars from a HYG database CSV (`hip,ra,dec,pmra,pmdec,mag` columns,
+/// looked up by header name; `ra` is in hours).
+fn read_hyg_csv<R: BufRead>(reader: R) -> Vec<HipStar> {
+    let mut lines = reader.lines();
+    let header = split_csv(&lines.next().expect("Empty catalog").expect("Could not read header"));
+    let col = |name: &str| -> usize {
+        header
+            .iter()
+            .position(|h| h == name)
+            .unwrap_or_else(|| panic!("HYG column '{name}' not found in header"))
+    };
+    let (i_hip, i_ra, i_dec, i_pmra, i_pmdec, i_mag) = (
+        col("hip"),
+        col("ra"),
+        col("dec"),
+        col("pmra"),
+        col("pmdec"),
+        col("mag"),
+    );
+
+    let mut stars = Vec::new();
+    for line in lines {
+        let line = line.expect("Could not read line");
+        let f = split_csv(&line);
+        if f.len() <= i_mag.max(i_pmdec) {
+            continue;
+        }
+        // Rows without a Hipparcos id (Sol, non-HIP stars) are skipped.
+        let Ok(id) = f[i_hip].trim().parse::<u32>() else { continue };
+        let Ok(mag) = f[i_mag].trim().parse::<f32>() else { continue };
+        if mag > MAG_LIMIT {
+            continue;
+        }
+        let (Ok(ra_h), Ok(dec), Ok(pm_ra), Ok(pm_dec)) = (
+            f[i_ra].trim().parse::<f32>(),
+            f[i_dec].trim().parse::<f32>(),
+            f[i_pmra].trim().parse::<f32>(),
+            f[i_pmdec].trim().parse::<f32>(),
+        ) else {
+            continue;
+        };
+        stars.push(HipStar {
+            id,
+            mag,
+            eq: propagate(ra_h * 15.0, dec, pm_ra, pm_dec, EPOCH_HYG),
+        });
+    }
+    stars
+}
+
+fn read_hip_main(reader: BufReader<File>) -> Vec<HipStar> {
     let mut stars: Vec<HipStar> = Vec::new();
     reader.lines().for_each(|line| {
         let line = line.expect("Could not read line");
@@ -105,16 +194,10 @@ fn read_hip_main(reader: BufReader<File>) -> Vec<HipStar> {
             Err(_) => return,
         };
 
-        // Apply proper motion to target epoch
-        let ra = (ra + (pm_ra * delta_t / 3600000.))
-            .rem_euclid(360.)
-            .to_radians();
-        let dec = (dec + (pm_dec * delta_t / 3600000.)).to_radians();
-
         stars.push(HipStar {
             id: hip_id,
             mag,
-            eq: Equatorial { ra, dec },
+            eq: propagate(ra, dec, pm_ra, pm_dec, EPOCH_HIP_MAIN),
         });
     });
 
@@ -400,10 +483,14 @@ fn main() {
         } else {
             "hip_main.dat"
         };
-        println!("Reading Hipparcos catalog from {catalog}...");
+        println!("Reading star catalog from {catalog}...");
         let file = File::open(catalog).expect("Could not open catalog file");
         let reader = BufReader::new(file);
-        let stars = read_hip_main(reader);
+        let stars = if catalog.to_ascii_lowercase().ends_with(".csv") {
+            read_hyg_csv(reader)
+        } else {
+            read_hip_main(reader)
+        };
         println!("Read {} stars (mag ≤ {MAG_LIMIT})", stars.len());
         generate_database(&stars);
         println!("Database written to database.bin");
@@ -469,4 +556,33 @@ fn main() {
         errors.len(),
         n
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_csv_handles_quotes_and_empties() {
+        let f = split_csv(r#"0,,"a,b","say ""hi""",1.5"#);
+        assert_eq!(f, vec!["0", "", "a,b", r#"say "hi""#, "1.5"]);
+    }
+
+    #[test]
+    fn hyg_csv_parses_hip_rows_and_skips_others() {
+        let csv = "\"id\",\"hip\",\"proper\",\"ra\",\"dec\",\"pmra\",\"pmdec\",\"mag\"
+0,,Sol,0.0,0.0,0.0,0.0,-26.7
+1,11767,\"Polaris, the pole star\",2.5303,89.2641,44.22,-11.74,1.97
+2,,NoHip,1.0,2.0,0.0,0.0,2.0
+3,32349,Sirius,6.7525,-16.7161,-546.01,-1223.07,-1.44
+4,99999,Faint,3.0,10.0,0.0,0.0,7.5
+";
+        let stars = read_hyg_csv(std::io::Cursor::new(csv));
+        assert_eq!(stars.len(), 2, "Sol/no-hip/faint rows must be skipped");
+        assert_eq!(stars[0].id, 11767);
+        // ra is hours → degrees: 2.5303 h = 37.9545°, plus ~25 yr of pm (<0.01°)
+        assert!((stars[0].eq.ra.to_degrees() - 37.9545).abs() < 0.01);
+        assert!((stars[0].eq.dec.to_degrees() - 89.2641).abs() < 0.01);
+        assert_eq!(stars[1].id, 32349);
+    }
 }

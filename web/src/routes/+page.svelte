@@ -3,10 +3,12 @@
 	import { Go2rtcPlayer } from '$lib/player';
 	import type { PlayerMode, PlayerStatus } from '$lib/player';
 	import { AtometWebSocket } from '$lib/ws';
-	import type { AppState, SysStat, DetectionDebug, MeteorEvent } from '$lib/types';
+	import type { AppState, SysStat, DetectionDebug, MeteorEvent, FfSavedEvent, StarsEvent, SolverStatus } from '$lib/types';
 	import { draw } from 'svelte/transition';
 	import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom';
 	import { select } from 'd3-selection';
+	import { t } from '$lib/i18n';
+	import { projectConstellations } from '$lib/constellations';
 
 	// Stream name from URL query param, default 'main' (matches go2rtc.yaml)
 	const streamName = typeof window !== 'undefined'
@@ -27,7 +29,45 @@
 	let player = $state<Go2rtcPlayer | null>(null);
 	let ws: AtometWebSocket;
 	let showDebug = $state(false);
+	let showStars = $state(false);
+	let showConstellations = $state(false);
 	let detectionDebug = $state<DetectionDebug | null>(null);
+	let starsEvent = $state<StarsEvent | null>(null);
+	let solverStatus = $state<SolverStatus | null>(null);
+
+	function fmtDuration(s: number): string {
+		if (s < 90) return `${Math.round(s)}${t('s')}`;
+		if (s < 5400) return `${Math.round(s / 60)}${t('min')}`;
+		return `${Math.round(s / 3600)}${t('h')}`;
+	}
+
+	/** One-line calibration status for the Functions panel: [text, level]. */
+	function solverLine(s: SolverStatus | null): [string, 'ok' | 'work' | 'idle' | 'warn'] {
+		if (!s) return ['', 'idle'];
+		if (!s.enabled) return [t('Off'), 'idle'];
+		const progress = `${s.samples}/${s.need}`;
+		if (s.moved !== null && s.moved > 0.3 && !s.due) {
+			return [`${t('Camera moved?')} ${s.moved.toFixed(1)}°`, 'warn'];
+		}
+		if (s.has_ref && !s.due) {
+			return [`${t('Calibrated')} · ${t('verified')} ${fmtDuration(s.age ?? 0)} ${t('ago')}`, 'ok'];
+		}
+		const what = s.has_ref ? t('Verifying') : t('Calibrating');
+		if (s.trying || s.samples > 0) return [`${what} (${progress})`, 'work'];
+		if (!s.in_schedule) return [`${what}: ${t('waiting for night')}`, 'idle'];
+		if (s.retry_in !== null) return [`${what}: ${t('retry in')} ${fmtDuration(s.retry_in)}`, 'idle'];
+		return [`${what}…`, 'work'];
+	}
+	const solverState = $derived(solverLine(solverStatus));
+	// Constellation figures projected with the latest plate solve (null = no solution yet).
+	let constellations = $derived(
+		starsEvent?.solve
+			? projectConstellations(
+					starsEvent.solve.ra, starsEvent.solve.dec, starsEvent.solve.roll,
+					starsEvent.solve.lens,
+				)
+			: [],
+	);
 	let ispExprUs = $state(0);
 	let ispAgain = $state(0);
 	let ispDgain = $state(0);
@@ -45,10 +85,12 @@
 	let activeTab = $state("settings");
 	let stageEl = $state<HTMLDivElement | undefined>(undefined);
 	let zoomTransform = $state('');
+	let zoomK = $state(1);
+	let overlayTransform = $state('');
 	let bandwidth = $state(0);
 	let histZoomK = 1;
 	let histZoomX = 0;
-	let histLog = $state(true);
+	let histLog = $state(false);
 
 	let histogram = new Array(256).fill(0);
     let canvas;
@@ -60,6 +102,9 @@
 
 	const MAX_METEOR_LOG = 20;
 	let meteorLog = $state<MeteorEvent[]>([]);
+
+	const MAX_FF_LOG = 30;
+	let ffLog = $state<FfSavedEvent[]>([]);
 
 	$effect(() => {
 		if (!videoEl || !player) return;
@@ -104,6 +149,15 @@
 		ws.onMeteorEvent = (e) => {
 			meteorLog = [e, ...meteorLog.slice(0, MAX_METEOR_LOG - 1)];
 		};
+		ws.onMeteorEnd = (e) => {
+			// Final event with full trajectory — replace the confirmation-time entry
+			meteorLog = meteorLog.map((m) => (m.id === e.id ? e : m));
+		};
+		ws.onFfSaved = (e) => {
+			ffLog = [e, ...ffLog.slice(0, MAX_FF_LOG - 1)];
+		};
+		ws.onStars = (e) => { starsEvent = e; };
+		ws.onSolverStatus = (e) => { solverStatus = e; };
 		ws.connect();
 
 		// d3-zoom on stage
@@ -111,16 +165,22 @@
 			const el = stageEl;
 
 			const zoomBehavior = d3Zoom()
-				.scaleExtent([1, 20])
+				.scaleExtent([1, 40])
 				.on('zoom', (event: any) => {
-					const { x, y, k } = event.transform;
+					const t = event.transform; // mutate: d3 stores this same object
+					const k = t.k;
 
 					// Constrain pan so content always covers the viewport
 					const w = el.clientWidth;
 					const h = el.clientHeight;
-					const cx = Math.min(0, Math.max(x, w - w * k));
-					const cy = Math.min(0, Math.max(y, h - h * k));
+					t.x = Math.min(0, Math.max(t.x, w - w * k));
+					const cx = t.x;
+					t.y = Math.min(0, Math.max(t.y, h - h * k));
+					const cy = t.y;
 					zoomTransform = `translate(${cx}px,${cy}px) scale(${k})`;
+					// Same transform in the overlays' 640×360 viewBox units.
+					zoomK = k;
+					overlayTransform = `translate(${(cx * 640) / w} ${(cy * 360) / h}) scale(${k})`;
 				});
 
 			const sel = select(stageEl);
@@ -174,6 +234,80 @@
 
 	function send(type: string, value: unknown) {
 		ws?.send({ type, value });
+	}
+
+	function sendSchedule(type: string, start: number, end: number) {
+		ws?.send({ type, start, end });
+	}
+
+	// Hour selector: start ∈ 0..23, end ∈ start+1..start+24 (>24 = next day).
+	const startHourOptions = Array.from({ length: 24 }, (_, i) => i);
+	function endHourOptions(start: number): number[] {
+		return Array.from({ length: 24 }, (_, i) => start + 1 + i);
+	}
+	function hourLabel(h: number): string {
+		if (h < 24) return `${h}:00`;
+		return `${h - 24}:00 (+1)`;
+	}
+	function endDisplay(start: number, end: number): number {
+		return end <= start ? end + 24 : end;
+	}
+	type DnMode = 'auto' | 'day' | 'night';
+	function setDaynightMode(mode: DnMode) {
+		if (!appState) return;
+		if (mode === 'auto') {
+			appState.auto_daynight = true;
+			send('set_auto_daynight', true);
+		} else {
+			const night = mode === 'night';
+			appState.auto_daynight = false;
+			appState.night_mode = night;
+			send('set_night_mode', night);
+		}
+	}
+
+	type IrMode = 'auto' | 'on' | 'off';
+	function setIrMode(kind: 'ircut' | 'irled', mode: IrMode) {
+		if (!appState) return;
+		if (mode === 'auto') {
+			if (kind === 'ircut') { appState.auto_ircut = true; send('set_auto_ircut', true); }
+			else                  { appState.auto_irled = true; send('set_auto_irled', true); }
+		} else {
+			const on = mode === 'on';
+			if (kind === 'ircut') {
+				appState.auto_ircut = false;
+				appState.ircut_on = on;
+				send('set_ircut', on);
+			} else {
+				appState.auto_irled = false;
+				appState.irled_on = on;
+				send('set_irled', on);
+			}
+		}
+	}
+
+	type TwilightMode = 'hours' | 'civil' | 'astro';
+	function setTwilightMode(prefix: 'record' | 'timelapse' | 'detection', mode: TwilightMode) {
+		if (!appState) return;
+		const use_tw = mode !== 'hours';
+		const astro  = mode === 'astro';
+		(appState as any)[`${prefix}_use_twilight`]   = use_tw;
+		(appState as any)[`${prefix}_twilight_astro`] = astro;
+		send(`set_${prefix}_use_twilight`, use_tw);
+		send(`set_${prefix}_twilight_astro`, astro);
+	}
+
+	function clampEnd(start: number, end: number): number {
+		const d = endDisplay(start, end);
+		if (d <= start) return start + 1;
+		if (d > start + 24) return start + 24;
+		return d;
+	}
+
+	function confirmReboot() {
+		if (confirm(t('Reboot the device?'))) {
+			ws?.send({ type: 'reboot' });
+		}
 	}
 
 	const modeBadge: Record<NonNullable<PlayerMode>, { label: string; color: string }> = {
@@ -320,21 +454,64 @@
 
 		{#if showDebug}
 			<div class="isp-info">
-				<span>IT {ispExprUs}</span>
-				<span>AG {ispAgain}</span>
+				<span>IT {(ispExprUs / 1000).toFixed(1)}ms</span>
+				<span>AG {(ispAgain / 10).toFixed(1)}dB</span>
 				<span>AGi {ispAgi}</span>
-				<span>DG {ispDgain}</span>
+				<span>DG {(ispDgain / 10).toFixed(1)}dB</span>
 				<span>DGi {ispiDgi}</span>
-				<span>sDG {ispsDgain}</span>
-				<span>ITMAX {ispItMax}</span>
-				<span>AGMAX {ispAgMax}</span>
-				<span>iDGMAX {ispiDgMax}</span>
-				<span>sDGMAX {ispsDgMax}</span>
-				<span>ITMIN {ispItMin}</span>
-				<span>AGMIN {ispAgMin}</span>
-				<span>iDGMIN {ispiDgMin}</span>
-				<span>sDGMIN {ispsDgMin}</span>
+				<span>sDG {(ispsDgain / 10).toFixed(1)}dB</span>
+				<span>ITMAX {(ispItMax / 1000).toFixed(1)}ms</span>
+				<span>AGMAX {(ispAgMax / 10).toFixed(1)}dB</span>
+				<span>iDGMAX {(ispiDgMax / 10).toFixed(1)}dB</span>
+				<span>sDGMAX {(ispsDgMax / 10).toFixed(1)}dB</span>
+				<span>ITMIN {(ispItMin / 1000).toFixed(1)}ms</span>
+				<span>AGMIN {(ispAgMin / 10).toFixed(1)}dB</span>
+				<span>iDGMIN {(ispiDgMin / 10).toFixed(1)}dB</span>
+				<span>sDGMIN {(ispsDgMin / 10).toFixed(1)}dB</span>
 			</div>
+		{/if}
+
+		{#if showStars && starsEvent}
+			<svg class="det-overlay" viewBox="0 0 640 360" preserveAspectRatio="none">
+				<g transform={overlayTransform}>
+				{#each starsEvent.stars as s}
+					{#if s[3] === 1}
+						<!-- static source (hot pixel / persistent false positive) -->
+						<g stroke="#f44" stroke-width="1" opacity="0.8">
+							<line x1={s[0] - 3 / zoomK} y1={s[1] - 3 / zoomK} x2={s[0] + 3 / zoomK} y2={s[1] + 3 / zoomK} vector-effect="non-scaling-stroke" />
+							<line x1={s[0] - 3 / zoomK} y1={s[1] + 3 / zoomK} x2={s[0] + 3 / zoomK} y2={s[1] - 3 / zoomK} vector-effect="non-scaling-stroke" />
+						</g>
+					{:else if s[3] === 2}
+						<!-- tentative: not yet re-sighted often enough for the solver -->
+						<circle cx={s[0]} cy={s[1]} r={4 / zoomK} fill="none" stroke="#ff0" stroke-width="1" vector-effect="non-scaling-stroke" stroke-dasharray="2 2" opacity="0.4" />
+					{:else}
+						<circle cx={s[0]} cy={s[1]} r={4 / zoomK} fill="none" stroke="#ff0" stroke-width="1" vector-effect="non-scaling-stroke" opacity="0.85" />
+					{/if}
+				{/each}
+				</g>
+				<text x="636" y="14" text-anchor="end" fill="#ff0" font-size="11" font-family="monospace">
+					★{starsEvent.count}{starsEvent.tentative ? ` ?${starsEvent.tentative}` : ''}{starsEvent.rejected ? ` ✕${starsEvent.rejected}` : ''}{starsEvent.solve ? ` RA${starsEvent.solve.ra.toFixed(1)} Dec${starsEvent.solve.dec.toFixed(1)}` : ''}{starsEvent.threshold != null ? ` thr=${starsEvent.threshold}` : ''}{starsEvent.ts ? ` ${starsEvent.ts.slice(9, 11)}:${starsEvent.ts.slice(11, 13)}:${starsEvent.ts.slice(13, 15)}` : ''}
+				</text>
+			</svg>
+		{/if}
+
+		{#if showConstellations}
+			<svg class="det-overlay" viewBox="0 0 640 360" preserveAspectRatio="none">
+				<g transform={overlayTransform}>
+					{#each constellations as c}
+						{#each c.paths as path}
+							<polyline points={path.map((q) => `${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(' ')} fill="none" stroke="#4cf" stroke-width="1" vector-effect="non-scaling-stroke" opacity="0.7" />
+						{/each}
+						{#if c.label}
+							<!-- font size / offset divided by zoom so the label stays the same on screen -->
+							<text x={c.label[0]} y={c.label[1] - 6 / zoomK} text-anchor="middle" fill="#4cf" font-size={10 / zoomK} font-family="monospace" opacity="0.9">{c.name}</text>
+						{/if}
+					{/each}
+				</g>
+				{#if !starsEvent?.solve}
+					<text x="636" y="28" text-anchor="end" fill="#4cf" font-size="11" font-family="monospace">{t('No plate solution')}</text>
+				{/if}
+			</svg>
 		{/if}
 
 		{#if showDebug && detectionDebug}
@@ -372,8 +549,9 @@
 	<!-- ── Sidebar ────────────────────────────────── -->
 	<aside class="sidebar">
 	<div class="tab-bar">
-    <button class="tab" class:active={activeTab === 'settings'} onclick={() => activeTab = 'settings'}>Settings</button>
-    <button class="tab" class:active={activeTab === 'log'} onclick={() => activeTab = 'log'}>Log {meteorLog.length > 0 ? `(${meteorLog.length})` : ''}</button>
+    <button class="tab" class:active={activeTab === 'settings'} onclick={() => activeTab = 'settings'}>{t('Settings')}</button>
+    <button class="tab" class:active={activeTab === 'log'} onclick={() => activeTab = 'log'}>{t('Log')} {meteorLog.length > 0 ? `(${meteorLog.length})` : ''}</button>
+    <button class="tab" class:active={activeTab === 'ff'} onclick={() => activeTab = 'ff'}>FF {ffLog.length > 0 ? `(${ffLog.length})` : ''}</button>
   	</div>
 
   <!-- スクロール領域 -->
@@ -409,7 +587,7 @@
 
 		<div class="stats-block">
 			<div class="stats-labels">
-				<span class="ctrl-heading">HISTOGRAM</span>
+				<span class="ctrl-heading">{t('HISTOGRAM')}</span>
 				<button class="hist-log-btn" class:active={histLog}
 					onclick={() => { histLog = !histLog; draw_hist(histogram); }}>LOG</button>
 			</div>
@@ -419,119 +597,252 @@
 		<!-- Controls -->
 		{#if appState}
 			<div class="ctrl-group">
-				<span class="ctrl-heading">View</span>
+				<span class="ctrl-heading">{t('View')}</span>
 				<label class="ctrl-row">
-					<span>Debug overlay</span>
+					<span>{t('Debug overlay')}</span>
 					<input type="checkbox" bind:checked={showDebug} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Star overlay')}</span>
+					<input type="checkbox" bind:checked={showStars} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Constellation overlay')}</span>
+					<input type="checkbox" bind:checked={showConstellations} />
 				</label>
 			</div>
 
 			<div class="ctrl-group">
-				<span class="ctrl-heading">Camera</span>
+				<span class="ctrl-heading">{t('Camera')}</span>
+				<div class="ctrl-row">
+					<span>{t('Day / Night')}</span>
+					<select class="mode-input"
+						onchange={(e) => setDaynightMode(e.currentTarget.value as DnMode)}>
+						<option value="auto"  selected={appState.auto_daynight}>{t('Auto')}</option>
+						<option value="day"   selected={!appState.auto_daynight && !appState.night_mode}>{t('Day')}</option>
+						<option value="night" selected={!appState.auto_daynight && appState.night_mode}>{t('Night')}</option>
+					</select>
+				</div>
 				<label class="ctrl-row">
-					<span>Auto Day / Night</span>
-					<input type="checkbox" checked={appState.auto_daynight}
-						onchange={(e) => send('set_auto_daynight', e.currentTarget.checked)} />
-				</label>
-				<label class="ctrl-row">
-					<span>Night Mode</span>
-					<input type="checkbox" checked={appState.night_mode}
-						onchange={(e) => send('set_night_mode', e.currentTarget.checked)} />
-				</label>
-				<label class="ctrl-row">
-					<span>LED</span>
+					<span>{t('LED')}</span>
 					<input type="checkbox" checked={appState.led_on}
 						onchange={(e) => send('set_led', e.currentTarget.checked)} />
 				</label>
-				<label class="ctrl-row">
-					<span>IR LED</span>
-					<input type="checkbox" checked={appState.irled_on}
-						onchange={(e) => send('set_irled', e.currentTarget.checked)} />
-				</label>
-				<label class="ctrl-row">
-					<span>IR Cut</span>
-					<input type="checkbox" checked={appState.ircut_on}
-						onchange={(e) => send('set_ircut', e.currentTarget.checked)} />
-				</label>
-
 				<div class="ctrl-row">
-					<span>FPS</span>
-					<input type="range" min="5" max="25" step="5"
-						value={appState.fps}
-						oninput={(e) => {send('set_fps', +e.currentTarget.value); appState.fps = +e.currentTarget.value;}} />
-					<span class="slider-val">{appState.fps}<span class="slider-unit">fps</span></span>
+					<span>{t('IR LED')}</span>
+					<select class="mode-input"
+						onchange={(e) => setIrMode('irled', e.currentTarget.value as IrMode)}>
+						<option value="auto" selected={appState.auto_irled}>{t('Auto')}</option>
+						<option value="on"   selected={!appState.auto_irled && appState.irled_on}>{t('On')}</option>
+						<option value="off"  selected={!appState.auto_irled && !appState.irled_on}>{t('Off')}</option>
+					</select>
+				</div>
+				<div class="ctrl-row">
+					<span>{t('IR Cut')}</span>
+					<select class="mode-input"
+						onchange={(e) => setIrMode('ircut', e.currentTarget.value as IrMode)}>
+						<option value="auto" selected={appState.auto_ircut}>{t('Auto')}</option>
+						<option value="on"   selected={!appState.auto_ircut && appState.ircut_on}>{t('On')}</option>
+						<option value="off"  selected={!appState.auto_ircut && !appState.ircut_on}>{t('Off')}</option>
+					</select>
 				</div>
 
-				<label class="ctrl-row">
-					<span>Auto Exposure</span>
-					<input type="checkbox" bind:checked={appState.ae_enable}
-						onchange={(e) => send('set_ae_enable', e.currentTarget.checked)} />
-				</label>
-
-				<div class="slider-row">
-					<span class="slider-label">IT</span>
-					<input type="range" min={ispItMin} max={ispItMax} step="1" disabled={appState.ae_enable}
-						value={ispExprUs}
-						oninput={(e) => send('set_exposure_us', +e.currentTarget.value)} />
-					<span class="slider-val">{ispExprUs}<span class="slider-unit">ms</span></span>
-				</div>
-				<div class="slider-row">
-					<span class="slider-label">AG</span>
-					<input type="range" min={ispAgMin} max={ispAgMax} step="1" disabled={appState.ae_enable}
-						value={ispAgain} 
-						oninput={(e) => send('set_analog_gain', +e.currentTarget.value)} />
-					<span class="slider-val">{ispAgain}<span class="slider-unit"></span></span>
-				</div>
-				<div class="slider-row">
-					<span class="slider-label">DG</span>
-					<input type="range" min={ispiDgMin} max={ispiDgMax} step="1" disabled={appState.ae_enable}
-						value={ispDgain}
-						oninput={(e) => send('set_digital_gain', +e.currentTarget.value)} />
-					<span class="slider-val">{ispDgain}<span class="slider-unit"></span></span>
-				</div>
 			</div>
 
 			<div class="ctrl-group">
-				<span class="ctrl-heading">Functions</span>
+				<span class="ctrl-heading">{t('Functions')}</span>
+				{#if (appState.record_use_twilight || appState.timelapse_use_twilight || appState.detection_use_twilight || appState.solver_use_twilight)
+					&& Math.abs(appState.latitude - 35.6812) < 0.0001
+					&& Math.abs(appState.longitude - 139.7671) < 0.0001}
+					<a class="coord-warning" href="/settings">{t('⚠ Location is default (Tokyo). Configure in Settings.')}</a>
+				{/if}
 				<label class="ctrl-row">
-					<span>Recording</span>
+					<span>{t('Recording')}</span>
 					<input type="checkbox" checked={appState.record_enabled}
 						onchange={(e) => send('set_record', e.currentTarget.checked)} />
 				</label>
+				<div class="schedule-row">
+					<select class="mode-input"
+						onchange={(e) => setTwilightMode('record', e.currentTarget.value as TwilightMode)}>
+						<option value="hours" selected={!appState.record_use_twilight}>{t('Hours')}</option>
+						<option value="civil" selected={appState.record_use_twilight && !appState.record_twilight_astro}>{t('Civil')}</option>
+						<option value="astro" selected={appState.record_use_twilight && appState.record_twilight_astro}>{t('Astro')}</option>
+					</select>
+					{#if !appState.record_use_twilight}
+						<select class="hour-input"
+							onchange={(e) => { const s = +e.currentTarget.value; appState!.record_start_hour = s; appState!.record_end_hour = clampEnd(s, appState!.record_end_hour); sendSchedule('set_record_schedule', appState!.record_start_hour, appState!.record_end_hour); }}>
+							{#each startHourOptions as h}
+								<option value={h} selected={appState.record_start_hour === h}>{hourLabel(h)}</option>
+							{/each}
+						</select>
+						<span class="hour-sep">–</span>
+						<select class="hour-input"
+							onchange={(e) => { appState!.record_end_hour = +e.currentTarget.value; sendSchedule('set_record_schedule', appState!.record_start_hour, appState!.record_end_hour); }}>
+							{#each endHourOptions(appState.record_start_hour) as h}
+								<option value={h} selected={endDisplay(appState.record_start_hour, appState.record_end_hour) === h}>{hourLabel(h)}</option>
+							{/each}
+						</select>
+					{/if}
+				</div>
 				<label class="ctrl-row">
-					<span>Detection</span>
+					<span>{t('Timelapse')}</span>
+					<input type="checkbox" checked={appState.timelapse_enabled}
+						onchange={(e) => send('set_timelapse', e.currentTarget.checked)} />
+				</label>
+				<div class="schedule-row">
+					<select class="mode-input"
+						onchange={(e) => setTwilightMode('timelapse', e.currentTarget.value as TwilightMode)}>
+						<option value="hours" selected={!appState.timelapse_use_twilight}>{t('Hours')}</option>
+						<option value="civil" selected={appState.timelapse_use_twilight && !appState.timelapse_twilight_astro}>{t('Civil')}</option>
+						<option value="astro" selected={appState.timelapse_use_twilight && appState.timelapse_twilight_astro}>{t('Astro')}</option>
+					</select>
+					{#if !appState.timelapse_use_twilight}
+						<select class="hour-input"
+							onchange={(e) => { const s = +e.currentTarget.value; appState!.timelapse_start_hour = s; appState!.timelapse_end_hour = clampEnd(s, appState!.timelapse_end_hour); sendSchedule('set_timelapse_schedule', appState!.timelapse_start_hour, appState!.timelapse_end_hour); }}>
+							{#each startHourOptions as h}
+								<option value={h} selected={appState.timelapse_start_hour === h}>{hourLabel(h)}</option>
+							{/each}
+						</select>
+						<span class="hour-sep">–</span>
+						<select class="hour-input"
+							onchange={(e) => { appState!.timelapse_end_hour = +e.currentTarget.value; sendSchedule('set_timelapse_schedule', appState!.timelapse_start_hour, appState!.timelapse_end_hour); }}>
+							{#each endHourOptions(appState.timelapse_start_hour) as h}
+								<option value={h} selected={endDisplay(appState.timelapse_start_hour, appState.timelapse_end_hour) === h}>{hourLabel(h)}</option>
+							{/each}
+						</select>
+					{/if}
+				</div>
+				<label class="ctrl-row">
+					<span>{t('Detection')}</span>
 					<input type="checkbox" checked={appState.detection_enabled}
 						onchange={(e) => send('set_detection', e.currentTarget.checked)} />
+				</label>
+				<div class="schedule-row">
+					<select class="mode-input"
+						onchange={(e) => setTwilightMode('detection', e.currentTarget.value as TwilightMode)}>
+						<option value="hours" selected={!appState.detection_use_twilight}>{t('Hours')}</option>
+						<option value="civil" selected={appState.detection_use_twilight && !appState.detection_twilight_astro}>{t('Civil')}</option>
+						<option value="astro" selected={appState.detection_use_twilight && appState.detection_twilight_astro}>{t('Astro')}</option>
+					</select>
+					{#if !appState.detection_use_twilight}
+						<select class="hour-input"
+							onchange={(e) => { const s = +e.currentTarget.value; appState!.detection_start_hour = s; appState!.detection_end_hour = clampEnd(s, appState!.detection_end_hour); sendSchedule('set_detection_schedule', appState!.detection_start_hour, appState!.detection_end_hour); }}>
+							{#each startHourOptions as h}
+								<option value={h} selected={appState.detection_start_hour === h}>{hourLabel(h)}</option>
+							{/each}
+						</select>
+						<span class="hour-sep">–</span>
+						<select class="hour-input"
+							onchange={(e) => { appState!.detection_end_hour = +e.currentTarget.value; sendSchedule('set_detection_schedule', appState!.detection_start_hour, appState!.detection_end_hour); }}>
+							{#each endHourOptions(appState.detection_start_hour) as h}
+								<option value={h} selected={endDisplay(appState.detection_start_hour, appState.detection_end_hour) === h}>{hourLabel(h)}</option>
+							{/each}
+						</select>
+					{/if}
+				</div>
+				<label class="ctrl-row">
+					<span>{t('Detection Record')}</span>
+					<input type="checkbox" checked={appState.detection_record_enabled}
+						onchange={(e) => send('set_detection_record', e.currentTarget.checked)} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Plate Solver')}</span>
+					<input type="checkbox" checked={appState.solver_enabled}
+						onchange={(e) => { appState!.solver_enabled = e.currentTarget.checked; send('set_solver', e.currentTarget.checked); }} />
+				</label>
+				{#if solverState[0]}
+					<span class="solver-status {solverState[1]}">{solverState[0]}</span>
+				{/if}
+			</div>
+
+			<div class="ctrl-group">
+				<span class="ctrl-heading">{t('OSD')}</span>
+				<label class="ctrl-row">
+					<span>{t('Timestamp')}</span>
+					<input type="checkbox" checked={appState.show_timestamp}
+						onchange={(e) => send('set_show_timestamp', e.currentTarget.checked)} />
+				</label>
+				<div class="ctrl-row">
+					<span>{t('Position')}</span>
+					<select class="select"
+						value={appState.timestamp_position}
+						onchange={(e) => send('set_timestamp_position', +e.currentTarget.value)}>
+						<option value={0}>{t('Top-left')}</option>
+						<option value={1}>{t('Top-right')}</option>
+						<option value={2}>{t('Bottom-left')}</option>
+						<option value={3}>{t('Bottom-right')}</option>
+					</select>
+				</div>
+			</div>
+
+			<div class="ctrl-group">
+				<span class="ctrl-heading">{t('Webhooks')}</span>
+				<div class="text-row">
+					<span class="text-label">Discord</span>
+					<input type="text" class="url-input" placeholder="https://..."
+						value={appState.webhook_discord_url}
+						onchange={(e) => send('set_webhook_discord', e.currentTarget.value)} />
+				</div>
+				<div class="text-row">
+					<span class="text-label">Slack</span>
+					<input type="text" class="url-input" placeholder="https://..."
+						value={appState.webhook_slack_url}
+						onchange={(e) => send('set_webhook_slack', e.currentTarget.value)} />
+				</div>
+				<div class="text-row">
+					<span class="text-label">Generic</span>
+					<input type="text" class="url-input" placeholder="https://..."
+						value={appState.webhook_generic_url}
+						onchange={(e) => send('set_webhook_generic', e.currentTarget.value)} />
+				</div>
+				<label class="ctrl-row">
+					<span>{t('Notify on startup')}</span>
+					<input type="checkbox" checked={appState.webhook_notify_startup}
+						onchange={(e) => send('set_webhook_notify_startup', e.currentTarget.checked)} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Notify detection start')}</span>
+					<input type="checkbox" checked={appState.webhook_notify_detection_start}
+						onchange={(e) => send('set_webhook_notify_detection_start', e.currentTarget.checked)} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Notify detection end')}</span>
+					<input type="checkbox" checked={appState.webhook_notify_detection_end}
+						onchange={(e) => send('set_webhook_notify_detection_end', e.currentTarget.checked)} />
 				</label>
 			</div>
 
 			<div class="ctrl-group">
-				<span class="ctrl-heading">OSD</span>
-				<label class="ctrl-row">
-					<span>Timestamp</span>
-					<input type="checkbox" checked={appState.show_timestamp}
-						onchange={(e) => send('set_show_timestamp', e.currentTarget.checked)} />
-				</label>
+				<span class="ctrl-heading">{t('System')}</span>
+				<div class="ctrl-row">
+					<span>{t('Capture FITS')}</span>
+					<button class="action-btn" onclick={() => ws?.send({ type: 'capture_fits' })}>{t('Capture')}</button>
+				</div>
+				<div class="ctrl-row">
+					<span>{t('Reboot')}</span>
+					<button class="action-btn danger" onclick={confirmReboot}>{t('Reboot')}</button>
+				</div>
 			</div>
 		{/if}
 
 	</div>
-			<!-- ── Detection log (full width) ───────────────── -->
+			<!-- ── Detection log ───────────────── -->
 	<div style={`display:${activeTab === 'log' ? "flex" : "none"}`}  class="settings-bar">
 	{#if meteorLog.length > 0}
 		<div class="meteor-log">
 			<div class="log-header">
-				<span class="log-title">Meteors</span>
+				<span class="log-title">{t('Meteors')}</span>
 				<span class="log-count">{meteorLog.length}</span>
-				<button class="log-clear" onclick={() => { meteorLog = []; }}>clear</button>
+				<button class="log-clear" onclick={() => { meteorLog = []; }}>{t('clear')}</button>
 			</div>
 			{#each meteorLog as m}
 				<div class="log-entry">
 					<span class="log-ts">{m.ts.slice(9, 11)}:{m.ts.slice(11, 13)}:{m.ts.slice(13, 15)}</span>
 					<span class="log-id">#{m.id}</span>
+					{#if m.ff}<span class="log-tag">FF</span>{:else if m.short}<span class="log-tag">S</span>{/if}
 					<span class="log-speed">{m.speed.toFixed(1)} px/f</span>
 					<span class="log-dur">{m.frames} fr</span>
-					<a class="log-img" href="/files/detections/{m.ts}.png" target="_blank" rel="noopener noreferrer" title="View stack image">
+					<a class="log-img" href="/files/detections/{m.ts}.png" target="_blank" rel="noopener noreferrer" title={t('View stack image')}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
 						</svg>
@@ -539,8 +850,36 @@
 				</div>
 			{/each}
 		</div>
+	{:else}
+		<div class="log-empty">{t('No detections yet')}</div>
 	{/if}
 		</div>
+
+	<!-- ── FF log ───────────────── -->
+	<div style={`display:${activeTab === 'ff' ? "flex" : "none"}`} class="settings-bar">
+		<div class="meteor-log">
+			<div class="log-header">
+				<span class="log-title" style="color:#8be">{t('FF Blocks')}</span>
+				<span class="log-count">{ffLog.length}</span>
+				<button class="log-clear" onclick={() => { ffLog = []; }}>{t('clear')}</button>
+			</div>
+			{#if ffLog.length === 0}
+				<div class="log-empty">{t('No FF blocks saved yet')}</div>
+			{:else}
+				{#each ffLog as f}
+					<div class="log-entry">
+						<span class="log-ts">{f.ts.slice(9, 11)}:{f.ts.slice(11, 13)}:{f.ts.slice(13, 15)}</span>
+						<span class="ff-reason ff-reason--{f.reason}">{f.reason}</span>
+						<a class="log-img" href={f.path} download title={t('Download FITS')}>
+							<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+							</svg>
+						</a>
+					</div>
+				{/each}
+			{/if}
+		</div>
+	</div>
 	  </div>
 	</aside>
 
@@ -904,6 +1243,119 @@
 		font-size: 0.6rem;
 	}
 
+	.schedule-row {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		padding: 0.3rem 0;
+		border-top: 1px solid var(--border2);
+	}
+
+	.hour-input {
+		width: 3rem;
+		padding: 0.15rem 0.3rem;
+		font-family: monospace;
+		font-size: 0.75rem;
+		background: var(--input);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+	}
+
+	.mode-input {
+		flex: 1;
+		min-width: 0;
+		padding: 0.15rem 0.3rem;
+		font-size: 0.7rem;
+		background: var(--input);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+	}
+
+	.coord-warning {
+		display: block;
+		font-size: 0.7rem;
+		line-height: 1.3;
+		padding: 0.3rem 0.4rem;
+		margin: 0.2rem 0 0.1rem;
+		background: #3a2a0a;
+		color: #f90;
+		border-radius: 4px;
+		text-decoration: none;
+	}
+	.coord-warning:hover { background: #4a3510; }
+
+	.solver-status {
+		display: block;
+		font-size: 0.7rem;
+		line-height: 1.3;
+		padding: 0.15rem 0.4rem 0.3rem;
+		color: var(--text3);
+	}
+	.solver-status.ok { color: #4caf78; }
+	.solver-status.work { color: #6aa9ff; }
+	.solver-status.warn { color: #f90; }
+
+	.hour-sep {
+		color: var(--text3);
+		font-size: 0.75rem;
+	}
+
+	.text-row {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		padding: 0.3rem 0;
+		border-top: 1px solid var(--border2);
+	}
+	.text-row:first-of-type { border-top: none; }
+
+	.text-label {
+		font-size: 0.7rem;
+		font-weight: 600;
+		color: var(--text3);
+	}
+
+	.url-input {
+		width: 100%;
+		padding: 0.2rem 0.35rem;
+		font-family: monospace;
+		font-size: 0.7rem;
+		background: var(--input);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+		box-sizing: border-box;
+	}
+
+	.select {
+		padding: 0.15rem 0.3rem;
+		font-size: 0.75rem;
+		background: var(--input);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 3px;
+	}
+
+	.action-btn {
+		padding: 0.2rem 0.6rem;
+		font-size: 0.75rem;
+		background: var(--input);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		cursor: pointer;
+	}
+	.action-btn:hover { border-color: var(--text3); }
+	.action-btn.danger {
+		color: #e74c3c;
+		border-color: #6e2a23;
+	}
+	.action-btn.danger:hover {
+		background: #3a1a16;
+	}
+
 	/* ── Meteor log ─────────────────────────── */
 	.meteor-log {
 		background: var(--card);
@@ -948,8 +1400,34 @@
 
 	.log-ts    { color: var(--text4); flex-shrink: 0; }
 	.log-id    { color: #0f0;         flex-shrink: 0; }
+	.log-tag   {
+		color: #8be;
+		background: #1a3a5e;
+		border-radius: 3px;
+		padding: 0 0.25rem;
+		font-size: 0.65rem;
+		flex-shrink: 0;
+	}
 	.log-speed { color: #f80;         flex-shrink: 0; }
 	.log-dur   { color: var(--text3); flex-shrink: 0; }
 	.log-img   { color: var(--text3); flex-shrink: 0; display: flex; align-items: center; margin-left: auto; }
 	.log-img:hover { color: var(--text); }
+
+	.log-empty {
+		padding: 0.5rem 0;
+		color: var(--text4);
+		font-size: 0.75rem;
+		text-align: center;
+	}
+
+	.ff-reason {
+		font-size: 0.7rem;
+		font-weight: 600;
+		padding: 0.05rem 0.35rem;
+		border-radius: 3px;
+		flex-shrink: 0;
+	}
+	.ff-reason--detected    { background: #1a3a5e; color: #5bc; }
+	.ff-reason--interesting { background: #3a2a0a; color: #f90; }
+	.ff-reason--baseline    { background: #1a2a1a; color: #6a6; }
 </style>

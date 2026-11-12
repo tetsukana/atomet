@@ -23,6 +23,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     let app_state = state.app_state.clone();
     let mut sysstat_rx = state.sysstat_tx.subscribe();
     let mut detection_rx = state.detection_tx.subscribe();
+    let mut ff_rx = state.ff_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -32,6 +33,10 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
             }
             // Forward detection debug frames to this client
             Ok(json) = detection_rx.recv() => {
+                if sender.send(Message::Text(json)).await.is_err() { break; }
+            }
+            // Forward FF save events to this client
+            Ok(json) = ff_rx.recv() => {
                 if sender.send(Message::Text(json)).await.is_err() { break; }
             }
             // Receive commands from this client
@@ -67,10 +72,6 @@ async fn handle_command(
     match cmd_type {
         "get_bypass" => {
             return Some(ioctl_get_bypass());
-        }
-        "set_bypass" => {
-            let bits = cmd.get("bits").and_then(|v| v.as_array());
-            return Some(ioctl_set_bypass(bits));
         }
         "get_ae_attr" => {
             return Some(ioctl_get_ae());
@@ -131,24 +132,26 @@ async fn handle_command(
         "set_ircut" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
                 state.ircut_on = on;
-                // Apply to hardware
+                // Manual override implies leaving Auto mode.
+                state.auto_ircut = false;
                 let _ = if on {
                     crate::gpio::ircut_on().await
                 } else {
                     crate::gpio::ircut_off().await
                 };
-                log::info!("IR cut set to {}", on);
+                log::info!("IR cut set to {} (auto off)", on);
             }
         }
         "set_irled" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
                 state.irled_on = on;
+                state.auto_irled = false;
                 let _ = if on {
                     crate::gpio::irled_on().await
                 } else {
                     crate::gpio::irled_off().await
                 };
-                log::info!("IR LED set to {}", on);
+                log::info!("IR LED set to {} (auto off)", on);
             }
         }
         "set_led" => {
@@ -200,16 +203,6 @@ async fn handle_command(
                 log::info!("Detection record set to {}", on);
             }
         }
-        "set_detection_record_schedule" => {
-            if let (Some(s), Some(e)) = (
-                cmd.get("start").and_then(|v| v.as_u64()),
-                cmd.get("end").and_then(|v| v.as_u64()),
-            ) {
-                state.detection_record_start_hour = s as u32;
-                state.detection_record_end_hour = e as u32;
-                log::info!("Detection record schedule set to {}–{}", s, e);
-            }
-        }
         "set_detection" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
                 let was = state.detection_enabled;
@@ -222,25 +215,77 @@ async fn handle_command(
                 }
             }
         }
+        "set_detection_schedule" => {
+            if let (Some(s), Some(e)) = (
+                cmd.get("start").and_then(|v| v.as_u64()),
+                cmd.get("end").and_then(|v| v.as_u64()),
+            ) {
+                state.detection_start_hour = s as u32;
+                state.detection_end_hour = e as u32;
+                log::info!("Detection schedule set to {}–{}", s, e);
+            }
+        }
+        "set_solver" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.solver_enabled = on;
+                log::info!("Plate solver {}", if on { "enabled" } else { "disabled" });
+            }
+        }
+        "solver_recalibrate" => {
+            crate::wcs::RECALIBRATE.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::info!("Plate solver recalibration requested");
+        }
+        "set_solver_schedule" => {
+            if let (Some(s), Some(e)) = (
+                cmd.get("start").and_then(|v| v.as_u64()),
+                cmd.get("end").and_then(|v| v.as_u64()),
+            ) {
+                state.solver_start_hour = s as u32;
+                state.solver_end_hour = e as u32;
+                log::info!("Solver schedule set to {}–{}", s, e);
+            }
+        }
+        "set_solver_use_twilight" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.solver_use_twilight = on;
+            }
+        }
+        "set_solver_twilight_astro" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.solver_twilight_astro = on;
+            }
+        }
         "set_night_mode" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
-                if on {
-                    crate::daynight::apply_night().await;
-                    state.ircut_on = false;
-                    state.irled_on = true;
-                } else {
-                    crate::daynight::apply_day().await;
-                    state.ircut_on = true;
-                    state.irled_on = false;
+                crate::daynight::apply_scene(on, state.auto_ircut, state.auto_irled).await;
+                if state.auto_ircut {
+                    state.ircut_on = !on;
+                }
+                if state.auto_irled {
+                    state.irled_on = on;
                 }
                 state.night_mode = on;
-                log::info!("Night mode set to {}", on);
+                // Manual day/night choice implies leaving Auto.
+                state.auto_daynight = false;
+                log::info!("Night mode set to {} (auto off)", on);
             }
         }
         "set_auto_daynight" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
                 state.auto_daynight = on;
                 log::info!("Auto daynight set to {}", on);
+            }
+        }
+        "set_auto_ircut" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.auto_ircut = on;
+                log::info!("Auto IR Cut set to {}", on);
+            }
+        }
+        "set_auto_irled" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.auto_irled = on;
+                log::info!("Auto IR LED set to {}", on);
             }
         }
         "set_show_timestamp" => {
@@ -284,6 +329,98 @@ async fn handle_command(
         "set_webhook_notify_detection_end" => {
             if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
                 state.webhook_notify_detection_end = on;
+            }
+        }
+        "set_location" => {
+            let lat = cmd.get("latitude").and_then(|v| v.as_f64());
+            let lon = cmd.get("longitude").and_then(|v| v.as_f64());
+            if let (Some(lat), Some(lon)) = (lat, lon)
+                && (-90.0..=90.0).contains(&lat)
+                && (-180.0..=180.0).contains(&lon)
+            {
+                state.latitude = lat;
+                state.longitude = lon;
+                log::info!("Location set to ({:.4}, {:.4})", lat, lon);
+            }
+        }
+        "set_record_use_twilight" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.record_use_twilight = on;
+            }
+        }
+        "set_timelapse_use_twilight" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.timelapse_use_twilight = on;
+            }
+        }
+        "set_detection_use_twilight" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.detection_use_twilight = on;
+            }
+        }
+        "set_record_twilight_astro" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.record_twilight_astro = on;
+            }
+        }
+        "set_timelapse_twilight_astro" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.timelapse_twilight_astro = on;
+            }
+        }
+        "set_detection_twilight_astro" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.detection_twilight_astro = on;
+            }
+        }
+        "set_scheduled_reboot" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.scheduled_reboot_enabled = on;
+                log::info!("Scheduled reboot {}", if on { "enabled" } else { "disabled" });
+            }
+        }
+        "set_scheduled_reboot_hour" => {
+            if let Some(h) = cmd.get("value").and_then(|v| v.as_u64()) {
+                if h < 24 {
+                    state.scheduled_reboot_hour = h as u32;
+                    log::info!("Scheduled reboot hour = {}", h);
+                }
+            }
+        }
+        "set_bypass" => {
+            let resp = ioctl_set_bypass(cmd.get("bits").and_then(|v| v.as_array()));
+            // Mirror into AppState only on success, then fall through to the
+            // common save+broadcast path so the value persists across reboot.
+            let mut applied = false;
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
+                if parsed.get("type").and_then(|v| v.as_str()) == Some("bypass") {
+                    if let Some(arr) = parsed.get("bits").and_then(|v| v.as_array()) {
+                        state.isp_bypass = arr
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|x| x as u32))
+                            .collect();
+                        applied = true;
+                    }
+                }
+            }
+            if applied {
+                let new_state = Arc::new(state);
+                app_state.store(Arc::clone(&new_state));
+                tokio::spawn(async move {
+                    if let Err(e) = crate::config::save_config(&new_state).await {
+                        log::error!("Failed to save config: {}", e);
+                    }
+                });
+            }
+            return Some(resp);
+        }
+        "set_timezone" => {
+            if let Some(tz) = cmd.get("value").and_then(|v| v.as_str()) {
+                let tz = tz.trim();
+                if !tz.is_empty() && tz.len() <= 64 {
+                    state.timezone = tz.to_string();
+                    crate::system::apply_timezone(tz);
+                }
             }
         }
         "set_fps" => {

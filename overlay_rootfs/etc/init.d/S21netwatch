@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# WiFi connectivity watchdog.
+#
+# wpa_supplicant は通常自動で再アソシエートするが、ATBM603x ドライバが
+# 固まると再接続すら起きないことがある。デフォルトゲートウェイへの ping が
+# 連続して失敗したらネットワークを丸ごと再起動して回復させる。
+#
+# wlan0 で接続している場合のみ監視する (eth0 接続時は何もしない)。
+#
+
+PIDFILE=/var/run/netwatch.pid
+INTERVAL=30      # 監視間隔 (秒)
+MAX_FAILS=4      # 連続失敗で再起動する回数 (= 約2分の無応答)
+
+default_gw() {
+    route -n 2>/dev/null | awk '$1=="0.0.0.0" && $8=="wlan0" { print $2; exit }'
+}
+
+watch_loop() {
+    fails=0
+    while true; do
+        sleep "$INTERVAL"
+
+        # wlan0 が接続インターフェースでなければ何もしない
+        ifconfig wlan0 2>/dev/null | grep -q 'inet addr' || { fails=0; continue; }
+
+        gw=$(default_gw)
+        if [ -n "$gw" ] && ping -c 1 -W 3 "$gw" > /dev/null 2>&1; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            if [ "$fails" -ge "$MAX_FAILS" ]; then
+                logger -t netwatch "WiFi unreachable (gw=${gw:-none}), restarting network"
+                /etc/init.d/S20network restart
+                fails=0
+            fi
+        fi
+    done
+}
+
+case "$1" in
+    start)
+        echo "Starting netwatch..."
+        watch_loop &
+        echo $! > "$PIDFILE"
+        echo "OK"
+        ;;
+    stop)
+        echo "Stopping netwatch..."
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

@@ -7,6 +7,9 @@ DAEMON=/usr/bin/atometd
 DAEMON_SD=/media/mmc/atometd
 PIDFILE=/var/run/atometd.pid
 
+# atomet 同梱のドライバ (post_build.sh でビルドされ rootfs に配置)
+DRV_DIR=/lib/modules/atomet
+
 # SD カードにバイナリがあればそちらを優先（開発用）
 if [ -f "$DAEMON_SD" ] && [ -x "$DAEMON_SD" ]; then
     DAEMON="$DAEMON_SD"
@@ -14,27 +17,38 @@ fi
 
 [ -f "$DAEMON" ] || exit 0
 
+# Pick a kernel module: SD-card override > rootfs-bundled.
+# (SD-card override is for dev use — drop a known-good .ko at /media/mmc/.)
+pick_module() {
+    name="$1"
+    if [ -f "/media/mmc/$name" ]; then
+        echo "/media/mmc/$name"
+    else
+        echo "$DRV_DIR/$name"
+    fi
+}
+
 load_modules() {
-    # ISP・センサー等のカーネルモジュールをロード
-    #insmod /atom/system/driver/tx-isp-t31.ko isp_clk=100000000
-    insmod /media/mmc/tx-isp-t31-patched.ko isp_clk=100000000
+    isp_ko=$(pick_module tx-isp-t31.ko)
+    echo "  insmod $isp_ko"
+    insmod "$isp_ko" isp_clk=100000000
+
     insmod /atom/system/driver/avpu.ko
     insmod /atom/system/driver/sinfo.ko
     insmod /atom/system/driver/audio.ko spk_gpio=-1
     insmod /atom/system/driver/sample_pwm_core.ko
     insmod /atom/system/driver/sample_pwm_hal.ko
     insmod /atom/system/driver/speaker_ctl.ko
-    # Use custom gc2053 driver from SD card if available, else stock
-    if [ -f /media/mmc/sensor_gc2053_t31.ko ]; then
-        insmod /media/mmc/sensor_gc2053_t31.ko data_interface=1
-    else
-        insmod /atom/system/driver/sensor_gc2053_t31.ko data_interface=1
-    fi
+
+    #sensor_ko=$(pick_module sensor_gc2053_t31.ko)
+    #echo "  insmod $sensor_ko"
+    #insmod "$sensor_ko" data_interface=1
+    insmod /atom/system/driver/sensor_gc2053_t31.ko data_interface=1
 }
 
 start() {
+    cp /atom/etc/sensor/gc2053-t31.bin /media/mmc/gc2053-t31.bin
     echo "Loading kernel modules..."
-    cp /atom/system/driver/tx-isp-t31.ko /media/mmc/tx-isp-t31.ko
     load_modules
     echo "Starting atometd..."
     "$DAEMON" &

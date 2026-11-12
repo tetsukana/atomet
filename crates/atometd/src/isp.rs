@@ -1,12 +1,12 @@
 use chrono::{Local, Timelike};
 use isvp_sys::*;
-use std::fs::File;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::config::AppState;
+use crate::fits;
+use crate::paths;
 use crate::watchdog::WatchdogHandle;
 
 const SENSOR_NAME: &[u8] = b"gc2053";
@@ -49,10 +49,10 @@ pub unsafe fn isp_init(app_state: &AppState) -> bool {
     }
 
     // Use ISP bin from SD card if present (allows tuning without rebuild)
-    if std::path::Path::new("/media/mmc/gc2053-t31.bin").exists() {
-        let path = b"/media/mmc/gc2053-t31.bin\0";
-        unsafe { IMP_ISP_SetDefaultBinPath(path.as_ptr() as *mut _) };
-        log::info!("ISP bin path: /media/mmc/gc2053-t31.bin (SD card override)");
+    if std::path::Path::new(paths::SENSOR_CAL).exists() {
+        let cstr = std::ffi::CString::new(paths::SENSOR_CAL).expect("SENSOR_CAL contains NUL");
+        unsafe { IMP_ISP_SetDefaultBinPath(cstr.as_ptr() as *mut _) };
+        log::info!("ISP bin path: {} (SD card override)", paths::SENSOR_CAL);
     } else {
         log::info!("ISP bin path: /etc/sensor/gc2053-t31.bin (default)");
     }
@@ -261,39 +261,27 @@ pub unsafe fn framesource_start() -> bool {
     true
 }
 
-fn pad_to_2880(mut v: Vec<u8>) -> Vec<u8> {
-    let pad = (2880 - (v.len() % 2880)) % 2880;
-    v.extend(vec![b' '; pad]);
-    v
-}
-
-fn make_card(s: &str) -> Vec<u8> {
-    let mut buf = vec![b' '; 80];
-    let bytes = s.as_bytes();
-    buf[..bytes.len()].copy_from_slice(bytes);
-    buf
-}
-
 fn save_to_fits(data: Vec<u8>) {
-    let mut header = Vec::new();
-
-    header.extend(make_card("SIMPLE  =                    T"));
-    header.extend(make_card("BITPIX  =                    8"));
-    header.extend(make_card("NAXIS   =                    2"));
-    header.extend(make_card("NAXIS1  =                 1920"));
-    header.extend(make_card("NAXIS2  =                 1080"));
-    header.extend(make_card("END"));
-
-    header = pad_to_2880(header);
-
-    let data = pad_to_2880(data);
-
     let now = Local::now();
-    let path = format!("/media/mmc/fits/{}.fits", now.format("%Y%m%d_%H%M%S"));
+    let header = fits::primary_image_header(
+        SENSOR_WIDTH as u32,
+        SENSOR_HEIGHT as u32,
+        false,
+        &[fits::card_str(
+            "DATE-OBS",
+            &now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+        )],
+    );
 
-    let mut file = File::create(&path).unwrap();
-    file.write_all(&header).unwrap();
-    file.write_all(&data).unwrap();
+    let mut bytes = Vec::with_capacity(header.len() + data.len() + 2880);
+    bytes.extend(header);
+    bytes.extend(fits::pad_data(data));
+
+    let path = paths::stills_dir(now).join(paths::still_filename(now));
+    match fits::atomic_write(&path, &bytes) {
+        Ok(()) => log::info!("Saved FITS: {}", path.display()),
+        Err(e) => log::error!("Failed to save FITS '{}': {}", path.display(), e),
+    }
 }
 
 /// Capture a single 1920×1080 Y-plane from framesource channel 0.

@@ -77,6 +77,9 @@ pub async fn gpio_init() -> std::io::Result<()> {
     ircut_on().await?;
     ircut_off().await?;
 
+    // Ensure IR LED starts OFF
+    irled_off().await?;
+
     Ok(())
 }
 
