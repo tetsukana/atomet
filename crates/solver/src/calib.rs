@@ -92,6 +92,23 @@ fn sky_frame(p: &V3) -> (V3, V3) {
     (n, e)
 }
 
+/// Unit vector (ICRS) of the sky point seen at pixel offset `(dx, dy)` from the
+/// image center (x right, y down; array index − W/2), for a camera with
+/// attitude `pose` and `lens`. Inverse of the projection used by the solver;
+/// `None` outside the lens model's range.
+pub fn pixel_to_sky(pose: &Pose, lens: &LensModel, dx: f64, dy: f64) -> Option<[f64; 3]> {
+    let th = lens.theta(dx.hypot(dy))?;
+    let pa = dx.atan2(dy) - pose.roll;
+    let (n, e) = sky_frame(&pose.pointing);
+    let (s, c) = th.sin_cos();
+    let (sp, cp) = pa.sin_cos();
+    Some(normalize([
+        c * pose.pointing[0] + s * (cp * n[0] + sp * e[0]),
+        c * pose.pointing[1] + s * (cp * n[1] + sp * e[1]),
+        c * pose.pointing[2] + s * (cp * n[2] + sp * e[2]),
+    ]))
+}
+
 // ───────────────────────────── lens model ─────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -296,10 +313,11 @@ fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
         }
         a.swap(col, piv);
         b.swap(col, piv);
+        let pivot_row = a[col].clone();
         for row in col + 1..n {
-            let k = a[row][col] / a[col][col];
-            for c in col..n {
-                a[row][c] -= k * a[col][c];
+            let k = a[row][col] / pivot_row[col];
+            for (x, p) in a[row][col..n].iter_mut().zip(&pivot_row[col..n]) {
+                *x -= k * p;
             }
             b[row] -= k * b[col];
         }
@@ -621,6 +639,28 @@ mod tests {
     }
 
     #[test]
+    fn pixel_to_sky_inverts_projection() {
+        let pose = pose_radec(335.9, 65.0, -86.5);
+        let lens = LensModel { f: 330.0, shape: Shape::Poly { c3: -0.07, c5: -0.014 } };
+        let mut rng = Lcg(7);
+        let cat = sky_catalog(4000, &mut rng);
+        let mut n = 0;
+        for p in project_catalog(&cat, &pose, &lens, 1.0) {
+            let sky = pixel_to_sky(&pose, &lens, p.px, p.py).unwrap();
+            // the catalog star this pixel came from must be recovered
+            let best = cat
+                .iter()
+                .map(|(v, _)| angle_deg(&from_vec3(v), &sky))
+                .fold(f64::MAX, f64::min);
+            // loose: the f32 catalog vectors are not exactly unit, which
+            // costs ~1e-2° in acos(θ) for stars right at the axis
+            assert!(best < 2e-2, "recovered {best}° off");
+            n += 1;
+        }
+        assert!(n > 100);
+    }
+
+    #[test]
     fn lens_theta_inverts_radius() {
         for lens in [
             LensModel::pinhole(344.0),
@@ -719,6 +759,6 @@ mod tests {
             .map(|_| (((rng.next() - 0.5) * FRAME_W) as f32, ((rng.next() - 0.5) * FRAME_H) as f32))
             .collect();
         let res = calibrate(&cat, &stars, pose_radec(100.0, 20.0, 0.0), LensModel::pinhole(344.0));
-        assert!(res.map_or(true, |c| !c.valid));
+        assert!(res.is_none_or(|c| !c.valid));
     }
 }

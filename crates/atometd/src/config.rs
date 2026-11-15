@@ -538,6 +538,7 @@ pub async fn load_config() -> AppState {
 ///   2. fsync the file
 ///   3. atomic rename to final path
 ///   4. fsync the parent directory (so the rename itself reaches SD)
+///
 /// Survives sudden power-loss without leaving a half-written file.
 pub async fn save_config(state: &AppState) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;

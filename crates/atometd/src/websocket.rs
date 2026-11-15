@@ -380,11 +380,11 @@ async fn handle_command(
             }
         }
         "set_scheduled_reboot_hour" => {
-            if let Some(h) = cmd.get("value").and_then(|v| v.as_u64()) {
-                if h < 24 {
-                    state.scheduled_reboot_hour = h as u32;
-                    log::info!("Scheduled reboot hour = {}", h);
-                }
+            if let Some(h) = cmd.get("value").and_then(|v| v.as_u64())
+                && h < 24
+            {
+                state.scheduled_reboot_hour = h as u32;
+                log::info!("Scheduled reboot hour = {}", h);
             }
         }
         "set_bypass" => {
@@ -392,16 +392,15 @@ async fn handle_command(
             // Mirror into AppState only on success, then fall through to the
             // common save+broadcast path so the value persists across reboot.
             let mut applied = false;
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
-                if parsed.get("type").and_then(|v| v.as_str()) == Some("bypass") {
-                    if let Some(arr) = parsed.get("bits").and_then(|v| v.as_array()) {
-                        state.isp_bypass = arr
-                            .iter()
-                            .filter_map(|v| v.as_u64().map(|x| x as u32))
-                            .collect();
-                        applied = true;
-                    }
-                }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp)
+                && parsed.get("type").and_then(|v| v.as_str()) == Some("bypass")
+                && let Some(arr) = parsed.get("bits").and_then(|v| v.as_array())
+            {
+                state.isp_bypass = arr
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as u32))
+                    .collect();
+                applied = true;
             }
             if applied {
                 let new_state = Arc::new(state);
@@ -425,10 +424,18 @@ async fn handle_command(
         }
         "set_fps" => {
             if let Some(v) = cmd.get("value").and_then(|v| v.as_u64()) {
-                let fps = (v as u32).clamp(1, 30);
-                state.fps = fps;
-                unsafe { isvp_sys::IMP_ISP_Tuning_SetSensorFPS(fps, 1) };
-                log::info!("FPS set to {}", fps);
+                // Only the supported presets: 25 (default) and 15 (low light:
+                // up to ~67 ms exposure per frame). Detection and FF timing
+                // are validated for these; the sensor driver itself accepts 5..30.
+                const FPS_PRESETS: [u32; 2] = [15, 25];
+                let fps = v as u32;
+                if FPS_PRESETS.contains(&fps) {
+                    state.fps = fps;
+                    unsafe { isvp_sys::IMP_ISP_Tuning_SetSensorFPS(fps, 1) };
+                    log::info!("FPS set to {}", fps);
+                } else {
+                    log::warn!("Ignoring unsupported fps {} (presets: {:?})", v, FPS_PRESETS);
+                }
             }
         }
         _ => {

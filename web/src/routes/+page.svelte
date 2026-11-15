@@ -8,7 +8,8 @@
 	import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom';
 	import { select } from 'd3-selection';
 	import { t } from '$lib/i18n';
-	import { projectConstellations } from '$lib/constellations';
+	import { projectConstellations, makeCamera, projectGrid } from '$lib/constellations';
+	import { solverLine, fmtRa, fmtDec } from '$lib/solver';
 
 	// Stream name from URL query param, default 'main' (matches go2rtc.yaml)
 	const streamName = typeof window !== 'undefined'
@@ -29,45 +30,63 @@
 	let player = $state<Go2rtcPlayer | null>(null);
 	let ws: AtometWebSocket;
 	let showDebug = $state(false);
-	let showStars = $state(false);
 	let showConstellations = $state(false);
+	let showGrid = $state(false);
+	let showCursor = $state(false);
 	let detectionDebug = $state<DetectionDebug | null>(null);
 	let starsEvent = $state<StarsEvent | null>(null);
 	let solverStatus = $state<SolverStatus | null>(null);
+	// Zoom of the stage (d3-zoom): scale and pan offset in the overlays' 640×360
+	// viewBox units. Declared before the derived overlay values that read them.
+	let zoomK = $state(1);
+	let zoomX = $state(0);
+	let zoomY = $state(0);
 
-	function fmtDuration(s: number): string {
-		if (s < 90) return `${Math.round(s)}${t('s')}`;
-		if (s < 5400) return `${Math.round(s / 60)}${t('min')}`;
-		return `${Math.round(s / 3600)}${t('h')}`;
-	}
-
-	/** One-line calibration status for the Functions panel: [text, level]. */
-	function solverLine(s: SolverStatus | null): [string, 'ok' | 'work' | 'idle' | 'warn'] {
-		if (!s) return ['', 'idle'];
-		if (!s.enabled) return [t('Off'), 'idle'];
-		const progress = `${s.samples}/${s.need}`;
-		if (s.moved !== null && s.moved > 0.3 && !s.due) {
-			return [`${t('Camera moved?')} ${s.moved.toFixed(1)}°`, 'warn'];
-		}
-		if (s.has_ref && !s.due) {
-			return [`${t('Calibrated')} · ${t('verified')} ${fmtDuration(s.age ?? 0)} ${t('ago')}`, 'ok'];
-		}
-		const what = s.has_ref ? t('Verifying') : t('Calibrating');
-		if (s.trying || s.samples > 0) return [`${what} (${progress})`, 'work'];
-		if (!s.in_schedule) return [`${what}: ${t('waiting for night')}`, 'idle'];
-		if (s.retry_in !== null) return [`${what}: ${t('retry in')} ${fmtDuration(s.retry_in)}`, 'idle'];
-		return [`${what}…`, 'work'];
-	}
 	const solverState = $derived(solverLine(solverStatus));
-	// Constellation figures projected with the latest plate solve (null = no solution yet).
+	// Attitude for the sky overlays. The locked reference (sent every block in
+	// solver_status, even while the solver is idle) wins; the latest live solve
+	// is only the fallback while no reference exists yet.
+	const skyPose = $derived(
+		solverStatus?.pose
+			?? (starsEvent?.solve
+				? {
+						ra: starsEvent.solve.ra, dec: starsEvent.solve.dec,
+						roll: starsEvent.solve.roll, lens: starsEvent.solve.lens ?? { f: 344 },
+					}
+				: null),
+	);
+	const skyCamera = $derived(
+		skyPose ? makeCamera(skyPose.ra, skyPose.dec, skyPose.roll, skyPose.lens) : null,
+	);
 	let constellations = $derived(
-		starsEvent?.solve
-			? projectConstellations(
-					starsEvent.solve.ra, starsEvent.solve.dec, starsEvent.solve.roll,
-					starsEvent.solve.lens,
-				)
+		skyPose ? projectConstellations(skyPose.ra, skyPose.dec, skyPose.roll, skyPose.lens) : [],
+	);
+	// Visible part of the frame under the current zoom/pan; the grid re-picks its
+	// spacing and label precision from it, so zooming in refines the ticks.
+	const gridLines = $derived(
+		skyCamera
+			? projectGrid(skyCamera, {
+					x0: -zoomX / zoomK, y0: -zoomY / zoomK,
+					x1: (640 - zoomX) / zoomK, y1: (360 - zoomY) / zoomK,
+				})
 			: [],
 	);
+
+	// Cursor readout: frame pixel + RA/Dec under the pointer.
+	let cursor = $state<{ x: number; y: number; ra: number; dec: number } | null>(null);
+	function onStagePointer(ev: PointerEvent) {
+		if (!showCursor || !stageEl) { cursor = null; return; }
+		const r = stageEl.getBoundingClientRect();
+		if (r.width === 0 || r.height === 0) return;
+		// Stage → overlay viewBox units, then undo the current zoom/pan.
+		const vx = ((ev.clientX - r.left) / r.width) * 640;
+		const vy = ((ev.clientY - r.top) / r.height) * 360;
+		const x = (vx - zoomX) / zoomK;
+		const y = (vy - zoomY) / zoomK;
+		if (x < 0 || y < 0 || x > 640 || y > 360) { cursor = null; return; }
+		const [ra, dec] = skyCamera ? skyCamera.pxToSky(x, y) : [NaN, NaN];
+		cursor = { x, y, ra, dec };
+	}
 	let ispExprUs = $state(0);
 	let ispAgain = $state(0);
 	let ispDgain = $state(0);
@@ -85,7 +104,6 @@
 	let activeTab = $state("settings");
 	let stageEl = $state<HTMLDivElement | undefined>(undefined);
 	let zoomTransform = $state('');
-	let zoomK = $state(1);
 	let overlayTransform = $state('');
 	let bandwidth = $state(0);
 	let histZoomK = 1;
@@ -180,6 +198,8 @@
 					zoomTransform = `translate(${cx}px,${cy}px) scale(${k})`;
 					// Same transform in the overlays' 640×360 viewBox units.
 					zoomK = k;
+					zoomX = (cx * 640) / w;
+					zoomY = (cy * 360) / h;
 					overlayTransform = `translate(${(cx * 640) / w} ${(cy * 360) / h}) scale(${k})`;
 				});
 
@@ -401,7 +421,14 @@
 <div class="page">
 
 	<!-- ── Video stage ───────────────────────────── -->
-	<div class="stage" bind:this={stageEl}>
+	<div
+		class="stage"
+		bind:this={stageEl}
+		role="presentation"
+		onpointermove={onStagePointer}
+		onpointerdown={onStagePointer}
+		onpointerleave={() => { cursor = null; }}
+	>
 	<div class="zoom-content" style="transform:{zoomTransform}">
 		<video bind:this={videoEl} autoplay muted playsinline></video>
 	</div><!-- zoom-content (video only) -->
@@ -471,28 +498,34 @@
 			</div>
 		{/if}
 
-		{#if showStars && starsEvent}
+		{#if showGrid}
 			<svg class="det-overlay" viewBox="0 0 640 360" preserveAspectRatio="none">
 				<g transform={overlayTransform}>
-				{#each starsEvent.stars as s}
-					{#if s[3] === 1}
-						<!-- static source (hot pixel / persistent false positive) -->
-						<g stroke="#f44" stroke-width="1" opacity="0.8">
-							<line x1={s[0] - 3 / zoomK} y1={s[1] - 3 / zoomK} x2={s[0] + 3 / zoomK} y2={s[1] + 3 / zoomK} vector-effect="non-scaling-stroke" />
-							<line x1={s[0] - 3 / zoomK} y1={s[1] + 3 / zoomK} x2={s[0] + 3 / zoomK} y2={s[1] - 3 / zoomK} vector-effect="non-scaling-stroke" />
-						</g>
-					{:else if s[3] === 2}
-						<!-- tentative: not yet re-sighted often enough for the solver -->
-						<circle cx={s[0]} cy={s[1]} r={4 / zoomK} fill="none" stroke="#ff0" stroke-width="1" vector-effect="non-scaling-stroke" stroke-dasharray="2 2" opacity="0.4" />
-					{:else}
-						<circle cx={s[0]} cy={s[1]} r={4 / zoomK} fill="none" stroke="#ff0" stroke-width="1" vector-effect="non-scaling-stroke" opacity="0.85" />
-					{/if}
-				{/each}
+					{#each gridLines as g}
+						{#each g.paths as path}
+							<polyline points={path.map((q) => `${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(' ')} fill="none" stroke={g.kind === 'ra' ? '#fa6' : '#8d8'} stroke-width="1" vector-effect="non-scaling-stroke" stroke-dasharray="3 3" opacity="0.55" />
+						{/each}
+						{#if g.at}
+							<text x={g.at[0] + (g.kind === 'dec' ? 3 : 0) / zoomK} y={g.at[1] - 2 / zoomK} text-anchor={g.kind === 'ra' ? 'middle' : 'start'} fill={g.kind === 'ra' ? '#fa6' : '#8d8'} font-size={9 / zoomK} font-family="monospace" opacity="0.9">{g.label}</text>
+						{/if}
+					{/each}
 				</g>
-				<text x="636" y="14" text-anchor="end" fill="#ff0" font-size="11" font-family="monospace">
-					★{starsEvent.count}{starsEvent.tentative ? ` ?${starsEvent.tentative}` : ''}{starsEvent.rejected ? ` ✕${starsEvent.rejected}` : ''}{starsEvent.solve ? ` RA${starsEvent.solve.ra.toFixed(1)} Dec${starsEvent.solve.dec.toFixed(1)}` : ''}{starsEvent.threshold != null ? ` thr=${starsEvent.threshold}` : ''}{starsEvent.ts ? ` ${starsEvent.ts.slice(9, 11)}:${starsEvent.ts.slice(11, 13)}:${starsEvent.ts.slice(13, 15)}` : ''}
-				</text>
+				{#if !skyCamera}
+					<text x="636" y="42" text-anchor="end" fill="#8d8" font-size="11" font-family="monospace">{t('No plate solution')}</text>
+				{/if}
 			</svg>
+		{/if}
+
+		{#if showCursor && cursor}
+			<div class="cursor-info">
+				<span>x {cursor.x.toFixed(1)} y {cursor.y.toFixed(1)}</span>
+				{#if Number.isFinite(cursor.ra)}
+					<span>RA {fmtRa(cursor.ra)} ({cursor.ra.toFixed(2)}°)</span>
+					<span>Dec {fmtDec(cursor.dec)} ({cursor.dec.toFixed(2)}°)</span>
+				{:else}
+					<span>{t('No plate solution')}</span>
+				{/if}
+			</div>
 		{/if}
 
 		{#if showConstellations}
@@ -508,7 +541,7 @@
 						{/if}
 					{/each}
 				</g>
-				{#if !starsEvent?.solve}
+				{#if !skyPose}
 					<text x="636" y="28" text-anchor="end" fill="#4cf" font-size="11" font-family="monospace">{t('No plate solution')}</text>
 				{/if}
 			</svg>
@@ -524,7 +557,7 @@
 					/>
 				{/each}
 				{#each detectionDebug.l as [x0, y0, x1, y1]}
-					<line {x0} {y0} {x1} {y1} stroke="#0ff" stroke-width="1.5" opacity="0.85" />
+					<line x1={x0} y1={y0} x2={x1} y2={y1} stroke="#0ff" stroke-width="1.5" opacity="0.85" />
 				{/each}
 				{#each detectionDebug.t as [id, mx, my, cnt]}
 					<circle cx={mx} cy={my} r={cnt >= 2 ? 5 : 3}
@@ -603,12 +636,16 @@
 					<input type="checkbox" bind:checked={showDebug} />
 				</label>
 				<label class="ctrl-row">
-					<span>{t('Star overlay')}</span>
-					<input type="checkbox" bind:checked={showStars} />
-				</label>
-				<label class="ctrl-row">
 					<span>{t('Constellation overlay')}</span>
 					<input type="checkbox" bind:checked={showConstellations} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Grid overlay')}</span>
+					<input type="checkbox" bind:checked={showGrid} />
+				</label>
+				<label class="ctrl-row">
+					<span>{t('Cursor readout')}</span>
+					<input type="checkbox" bind:checked={showCursor} />
 				</label>
 			</div>
 
@@ -621,6 +658,21 @@
 						<option value="auto"  selected={appState.auto_daynight}>{t('Auto')}</option>
 						<option value="day"   selected={!appState.auto_daynight && !appState.night_mode}>{t('Day')}</option>
 						<option value="night" selected={!appState.auto_daynight && appState.night_mode}>{t('Night')}</option>
+					</select>
+				</div>
+				<div class="ctrl-row">
+					<span>{t('Frame rate')}</span>
+					<select class="mode-input"
+						onchange={(e) => {
+							const v = Number(e.currentTarget.value);
+							if (appState) appState.fps = v;
+							send('set_fps', v);
+						}}>
+						<option value="25" selected={appState.fps === 25}>25 fps</option>
+						<option value="15" selected={appState.fps === 15}>15 fps ({t('low light')})</option>
+						{#if appState.fps !== 25 && appState.fps !== 15}
+							<option value={appState.fps} selected>{appState.fps} fps</option>
+						{/if}
 					</select>
 				</div>
 				<label class="ctrl-row">
@@ -1007,6 +1059,21 @@
 		font-family: monospace;
 	}
 
+	.cursor-info {
+		position: absolute;
+		top: 2.2rem;
+		left: 0.5rem;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.6rem;
+		font-size: 0.7rem;
+		font-family: monospace;
+		color: #fff;
+		background: rgba(0, 0, 0, 0.6);
+		padding: 0.15rem 0.5rem;
+		border-radius: 4px;
+		pointer-events: none;
+	}
 	.isp-info {
 		position: absolute;
 		bottom: 0.5rem;
@@ -1210,24 +1277,6 @@
 		color: var(--text3);
 		width: 1.6rem;
 		flex-shrink: 0;
-	}
-
-	.slider-row input[type="range"] {
-		flex: 1;
-		height: 4px;
-		appearance: none;
-		background: var(--input);
-		border-radius: 2px;
-		cursor: pointer;
-	}
-
-	.slider-row input[type="range"]::-webkit-slider-thumb {
-		appearance: none;
-		width: 14px;
-		height: 14px;
-		border-radius: 50%;
-		background: #2ecc71;
-		cursor: pointer;
 	}
 
 	.slider-val {

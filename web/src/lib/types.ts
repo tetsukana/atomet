@@ -124,6 +124,12 @@ export interface SolverStatus {
 	trying: boolean;           // an attempt burst is running
 	retry_in: number | null;   // seconds until the next attempt (backing off)
 	moved: number | null;      // degrees the last reference moved from the previous one
+	/** Locked reference attitude advanced to now (degrees); null = no reference.
+	 *  Lets the sky overlays draw without a running solver. */
+	pose?: {
+		ra: number; dec: number; roll: number;
+		lens: { f: number; c3?: number; c5?: number };
+	} | null;
 }
 
 /** Star extraction result from an FF block's mean frame */

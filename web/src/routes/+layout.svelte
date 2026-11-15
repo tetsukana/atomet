@@ -66,12 +66,6 @@
 				</svg>
 				{t('Mask')}
 			</a>
-			<a href="/solve" class:active={page.url.pathname.startsWith('/solve')}>
-				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-					<path d="M12 2l2.4 6.9L21 9.3l-5.4 4.2L17.6 21 12 16.8 6.4 21l2-7.5L3 9.3l6.6-.4z"/>
-				</svg>
-				{t('Solve')}
-			</a>
 			<a href="/settings" class:active={page.url.pathname.startsWith('/settings')}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 					<circle cx="12" cy="12" r="3"/>

@@ -61,6 +61,44 @@ const TRACK_MAX_EVENT_FRAMES: u32 = 75; // ~3s @ 25fps — longer-lived = aircra
 const TRACK_MIN_MONOTONIC: f32 = 0.8; // fraction of steps advancing along the principal axis
 const TRACK_MIN_SPEED_CELLS: f32 = 0.0625; // 0.5 px/frame — slower = satellite/aircraft
 
+/// Frame rate the per-frame tuning constants above were set at. The ones that
+/// are really durations or speeds (EMA_ALPHA, TRACK_MAX_EVENT_FRAMES,
+/// TRACK_MIN_SPEED_CELLS) are rescaled to the configured sensor fps so the
+/// real-time behaviour stays the same; at 25 fps nothing changes. The other
+/// constants (ring depth, history lengths, spatial gates) are deliberately
+/// left in frames.
+const REF_FPS: f32 = 25.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Timing {
+    /// Per-frame EMA weight with the same time constant in seconds.
+    ema_alpha: f32,
+    /// Meteor duration cap in frames (same seconds as at REF_FPS).
+    max_event_frames: u32,
+    /// Minimum speed in cells/frame (same cells/s as at REF_FPS).
+    min_speed_cells: f32,
+}
+
+impl Timing {
+    fn new(fps: u32) -> Self {
+        let fps = fps.clamp(1, 60) as f32;
+        // How many REF_FPS frames fit in one frame at `fps`.
+        let r = REF_FPS / fps;
+        if (r - 1.0).abs() < 1e-6 {
+            return Timing {
+                ema_alpha: EMA_ALPHA,
+                max_event_frames: TRACK_MAX_EVENT_FRAMES,
+                min_speed_cells: TRACK_MIN_SPEED_CELLS,
+            };
+        }
+        Timing {
+            ema_alpha: 1.0 - (1.0 - EMA_ALPHA).powf(r),
+            max_event_frames: ((TRACK_MAX_EVENT_FRAMES as f32 / r).round() as u32).max(1),
+            min_speed_cells: TRACK_MIN_SPEED_CELLS * r,
+        }
+    }
+}
+
 // ============================================================
 // Blob
 // ============================================================
@@ -605,12 +643,13 @@ impl Track {
         })
     }
 
-    fn is_confirmed(&self) -> bool {
+    /// `min_speed_cells`: speed floor in cells/frame (see `Timing`).
+    fn is_confirmed(&self, min_speed_cells: f32) -> bool {
         !self.rejected
             && self.metrics().is_some_and(|m| {
                 m.linearity >= TRACK_MIN_LINEARITY
                     && m.monotonic >= TRACK_MIN_MONOTONIC
-                    && m.speed >= TRACK_MIN_SPEED_CELLS
+                    && m.speed >= min_speed_cells
             })
     }
 }
@@ -654,12 +693,14 @@ fn associate(tracks: &[Track], centroids: &[(f32, f32)]) -> (Vec<(usize, usize)>
 // Detection task
 // ============================================================
 
+#[allow(clippy::too_many_arguments)]
 pub fn detection_task(
     mut luma_rx: watch::Receiver<Option<luma::LumaFrame>>,
     app_state: SharedAppState,
     shutdown: Arc<AtomicBool>,
     wd: WatchdogHandle,
     debug_tx: broadcast::Sender<String>,
+    meteor_tx: broadcast::Sender<String>,
     mask: Arc<ArcSwap<Vec<u8>>>,
     detection_active: Arc<AtomicBool>,
     detection_tracking: Arc<AtomicBool>,
@@ -675,6 +716,7 @@ pub fn detection_task(
     let mut cell_mean = vec![0f32; N_CELLS];
     let mut cell_var = vec![1f32; N_CELLS];
     let mut warmup: u32 = WARMUP_FRAMES;
+    let mut last_cfg_fps: u32 = 0;
     let mut tracks: Vec<Track> = Vec::new();
     let mut next_track_id: u32 = 0;
     // Pre-allocated ring buffer for pre-detection luma frames (no per-frame alloc)
@@ -721,6 +763,23 @@ pub fn detection_task(
             std::thread::sleep(INTERVAL);
             continue;
         }
+        let timing = Timing::new(s.fps);
+        // The configured fps changed: the sensor re-times and auto-exposure
+        // re-settles, so the old per-cell baselines and tracks are stale.
+        // Flush and re-learn for ~2 s (same reset as the schedule-off branch).
+        if last_cfg_fps != 0 && s.fps != last_cfg_fps {
+            log::info!("fps changed {} -> {}: resetting detector baselines", last_cfg_fps, s.fps);
+            if stack_active {
+                spawn_save_stack(stack_data.clone(), stack_ts.clone(), debug_tx.clone());
+                stack_active = false;
+            }
+            tracks.clear();
+            prev_luma = None;
+            luma_ring_idx = 0;
+            luma_ring_full = false;
+            warmup = WARMUP_FRAMES + 2 * s.fps;
+        }
+        last_cfg_fps = s.fps;
         drop(s);
 
         if handle.block_on(luma_rx.changed()).is_err() {
@@ -795,8 +854,8 @@ pub fn detection_task(
             // (or aircraft) passing through a cell doesn't inflate its
             // mean/variance and desensitize it for the next ~1/α frames.
             let d = delta.clamp(-EMA_CLAMP_SIGMA * sigma_t, EMA_CLAMP_SIGMA * sigma_t);
-            *mu += EMA_ALPHA * d;
-            *var = (1.0 - EMA_ALPHA) * (*var + EMA_ALPHA * d * d);
+            *mu += timing.ema_alpha * d;
+            *var = (1.0 - timing.ema_alpha) * (*var + timing.ema_alpha * d * d);
 
             if z_s > max_z_s {
                 max_z_s = z_s;
@@ -880,7 +939,7 @@ pub fn detection_task(
         // Demoted tracks stay in the list as association sinks so their
         // blobs don't spawn fresh tracks that re-confirm.
         for tr in tracks.iter_mut() {
-            if tr.confirmed && frame_index.wrapping_sub(tr.first_frame) > TRACK_MAX_EVENT_FRAMES {
+            if tr.confirmed && frame_index.wrapping_sub(tr.first_frame) > timing.max_event_frames {
                 tr.confirmed = false;
                 tr.rejected = true;
                 log::info!(
@@ -904,7 +963,7 @@ pub fn detection_task(
                 confirmed_ids.push(tr.id);
                 continue;
             }
-            if tr.is_confirmed() {
+            if tr.is_confirmed(timing.min_speed_cells) {
                 tr.confirmed = true;
                 confirmed_ids.push(tr.id);
 
@@ -938,6 +997,7 @@ pub fn detection_task(
                     median,
                     mad
                 );
+                let _ = meteor_tx.send(msg.clone());
                 let _ = debug_tx.send(msg);
 
                 // Initialize brightest stack from pre-detection ring buffer
@@ -1012,6 +1072,7 @@ pub fn detection_task(
                     r#"{{"type":"meteor_end","id":{},"speed":{:.2},"frames":{},"first_frame":{},"last_frame":{},"trajectory":[{}],"ts":"{}"}}"#,
                     tr.id, speed, n, tr.first_frame, frame_index, traj, ts
                 );
+                let _ = meteor_tx.send(msg.clone());
                 let _ = debug_tx.send(msg);
                 continue;
             }
@@ -1051,6 +1112,7 @@ pub fn detection_task(
                 s.elongation,
                 s.flux
             );
+            let _ = meteor_tx.send(msg.clone());
             let _ = debug_tx.send(msg);
 
             // Ring depth (LUMA_PREBUF=8) still covers the meteor frames at
@@ -1142,5 +1204,30 @@ pub fn detection_task(
             );
             elapsed_acc = 0;
         }
+    }
+}
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn reference_fps_is_unchanged() {
+        let t = Timing::new(25);
+        assert_eq!(t.ema_alpha, EMA_ALPHA);
+        assert_eq!(t.max_event_frames, TRACK_MAX_EVENT_FRAMES);
+        assert_eq!(t.min_speed_cells, TRACK_MIN_SPEED_CELLS);
+    }
+
+    #[test]
+    fn lower_fps_keeps_real_time_values() {
+        let t = Timing::new(15);
+        // 3 s cap: 75 frames @ 25 fps -> 45 frames @ 15 fps
+        assert_eq!(t.max_event_frames, 45);
+        // same cells/s: 0.0625 * 25 = 1.5625 cells/s -> per frame at 15 fps
+        assert!((t.min_speed_cells * 15.0 - TRACK_MIN_SPEED_CELLS * 25.0).abs() < 1e-5);
+        // same EMA time constant: decay over one second matches
+        let per_sec_ref = (1.0 - EMA_ALPHA).powi(25);
+        let per_sec = (1.0 - t.ema_alpha).powi(15);
+        assert!((per_sec - per_sec_ref).abs() < 1e-4);
     }
 }

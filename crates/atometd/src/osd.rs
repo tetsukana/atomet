@@ -251,10 +251,10 @@ pub fn osd_poll_loop(app_state: SharedAppState, shutdown: Arc<AtomicBool>) {
             }
         }
 
-        if last_show != Some(state.show_timestamp) {
-            if unsafe { imp_osd_toggle_show(state.show_timestamp) } {
-                last_show = Some(state.show_timestamp);
-            }
+        if last_show != Some(state.show_timestamp)
+            && unsafe { imp_osd_toggle_show(state.show_timestamp) }
+        {
+            last_show = Some(state.show_timestamp);
         }
 
         if state.show_timestamp {

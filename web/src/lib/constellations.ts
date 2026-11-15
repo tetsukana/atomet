@@ -147,17 +147,43 @@ function radius(theta: number, lens: LensProfile): number {
 	return lens.f * theta * (1 + theta * theta * (lens.c3 + theta * theta * lens.c5));
 }
 
+/** Angle off-axis (rad) of a source `r` px from the image center (inverse of `radius`). */
+function invRadius(r: number, lens: LensProfile): number {
+	if (lens.c3 === undefined || lens.c5 === undefined) return Math.atan(r / lens.f);
+	// Newton on r = f·θ(1 + c3θ² + c5θ⁴); monotonic over the usable range.
+	let th = r / lens.f;
+	for (let i = 0; i < 12; i++) {
+		const t2 = th * th;
+		const err = lens.f * th * (1 + t2 * (lens.c3 + t2 * lens.c5)) - r;
+		const d = lens.f * (1 + t2 * (3 * lens.c3 + t2 * 5 * lens.c5));
+		if (!(Math.abs(d) > 1e-9)) break;
+		const step = err / d;
+		th -= step;
+		if (Math.abs(step) < 1e-10) break;
+	}
+	return th;
+}
+
+export interface SkyCamera {
+	/** RA/Dec (deg) → px in the 640×360 frame; null beyond the lens range. */
+	skyToPx: (raDeg: number, decDeg: number) => [number, number] | null;
+	/** px in the 640×360 frame → [RA, Dec] in degrees (RA 0..360). */
+	pxToSky: (x: number, y: number) => [number, number];
+	/** Unit vector → px (null beyond the lens range). */
+	project: (v: V3) => [number, number] | null;
+}
+
 /**
- * Project every constellation for the given pointing (all angles in degrees).
- * `lens` is the solver's fitted profile; without it a pinhole of
- * FOCAL_LENGTH_PX is assumed. Same geometry as crates/solver/src/calib.rs:
- * a point at position angle PA (north → east) and distance θ from the
- * pointing lands at (r·sin(PA+roll), r·cos(PA+roll)) from the image center.
+ * Camera geometry for a pointing (all angles in degrees). `lens` is the
+ * solver's fitted profile; without it a pinhole of FOCAL_LENGTH_PX is
+ * assumed. Same geometry as crates/solver/src/calib.rs: a point at position
+ * angle PA (north → east) and distance θ from the pointing lands at
+ * (r·sin(PA+roll), r·cos(PA+roll)) from the image center.
  */
-export function projectConstellations(
+export function makeCamera(
 	raDeg: number, decDeg: number, rollDeg: number,
 	lens: LensProfile = { f: FOCAL_LENGTH_PX },
-): ProjectedConstellation[] {
+): SkyCamera {
 	const roll = rollDeg * D2R;
 	const p = radec(raDeg, decDeg);
 	// North / east axes at the pointing (same construction as compute_roll).
@@ -174,6 +200,184 @@ export function projectConstellations(
 		const r = radius(theta, lens);
 		return [FRAME_W / 2 + r * Math.sin(phi), FRAME_H / 2 + r * Math.cos(phi)];
 	};
+
+	const pxToSky = (x: number, y: number): [number, number] => {
+		const dx = x - FRAME_W / 2, dy = y - FRAME_H / 2;
+		const theta = invRadius(Math.hypot(dx, dy), lens);
+		const pa = Math.atan2(dx, dy) - roll; // position angle, north → east
+		const s = Math.sin(theta), c = Math.cos(theta);
+		const v: V3 = [
+			c * p[0] + s * (Math.cos(pa) * n[0] + Math.sin(pa) * e[0]),
+			c * p[1] + s * (Math.cos(pa) * n[1] + Math.sin(pa) * e[1]),
+			c * p[2] + s * (Math.cos(pa) * n[2] + Math.sin(pa) * e[2]),
+		];
+		const ra = (Math.atan2(v[1], v[0]) / D2R + 360) % 360;
+		return [ra, Math.asin(Math.max(-1, Math.min(1, v[2]))) / D2R];
+	};
+
+	return { skyToPx: (ra, dec) => project(radec(ra, dec)), pxToSky, project };
+}
+
+export interface GridLine {
+	/** Polyline pieces in 640×360 px (split where the projection fails). */
+	paths: [number, number][][];
+	/** Label text and anchor (px) inside the visible area, or null if not visible. */
+	label: string;
+	at: [number, number] | null;
+	kind: 'ra' | 'dec';
+}
+
+/** Visible part of the 640×360 frame (px), i.e. the frame under the current zoom/pan. */
+export interface ViewRect { x0: number; y0: number; x1: number; y1: number }
+
+// Dec steps in degrees: 30,20,10,5,2,1 deg, then the same in arcmin and arcsec.
+const DEC_STEPS = (() => {
+	const base = [30, 20, 10, 5, 2, 1];
+	return [...base, ...base.map((v) => v / 60), ...base.map((v) => v / 3600)];
+})();
+// RA steps in degrees of RA (1 h = 15°): 6,4,3,2,1 h, 30,20,10,5,2,1 min, 30,20,10,5,2,1 s.
+const RA_STEPS = (() => {
+	const hours = [6, 4, 3, 2, 1];
+	const mins = [30, 20, 10, 5, 2, 1];
+	const secs = [30, 20, 10, 5, 2, 1];
+	return [
+		...hours.map((h) => h * 15),
+		...mins.map((m) => (m / 60) * 15),
+		...secs.map((s) => (s / 3600) * 15),
+	];
+})();
+
+/** Largest step not above range / target (the table is descending). */
+function pickStep(range: number, steps: number[], target = 6): number {
+	const ideal = range / target;
+	for (const s of steps) if (s <= ideal) return s;
+	return steps[steps.length - 1];
+}
+
+function fmtRaLabel(raDeg: number, stepDeg: number): string {
+	let sec = Math.round(((raDeg % 360) + 360) % 360 / 15 * 3600) % 86400;
+	const h = Math.floor(sec / 3600);
+	sec -= h * 3600;
+	const m = Math.floor(sec / 60);
+	const s = sec - m * 60;
+	const stepH = stepDeg / 15;
+	if (stepH >= 1) return `${h}h`;
+	if (stepH * 60 >= 1) return `${h}h${String(m).padStart(2, '0')}m`;
+	return `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
+}
+
+function fmtDecLabel(decDeg: number, stepDeg: number): string {
+	const total = Math.round(Math.abs(decDeg) * 3600); // round first so -0 never prints a sign
+	const sign = total === 0 ? '' : decDeg < 0 ? '−' : '+';
+	const d = Math.floor(total / 3600);
+	const m = Math.floor((total - d * 3600) / 60);
+	const s = total - d * 3600 - m * 60;
+	if (stepDeg >= 1) return `${sign}${d}°`;
+	if (stepDeg * 60 >= 1) return `${sign}${d}°${String(m).padStart(2, '0')}′`;
+	return `${sign}${d}°${String(m).padStart(2, '0')}′${String(s).padStart(2, '0')}″`;
+}
+
+/**
+ * RA/Dec graticule that follows the zoom: the visible area `view` is mapped to
+ * sky coordinates and the spacing is the largest table step not above
+ * span / 6 (so roughly 6–15 lines across the view, in degrees → arcmin → arcsec
+ * and hours → minutes → seconds). Dec labels sit at the left edge of the view,
+ * RA labels at the bottom edge.
+ */
+export function projectGrid(
+	cam: SkyCamera,
+	view: ViewRect = { x0: 0, y0: 0, x1: FRAME_W, y1: FRAME_H },
+): GridLine[] {
+	const out: GridLine[] = [];
+
+	// Sky bounds of the visible area: sample its perimeter and center.
+	const N = 12;
+	const pts: [number, number][] = [];
+	for (let i = 0; i <= N; i++) {
+		const u = i / N;
+		const x = view.x0 + (view.x1 - view.x0) * u;
+		const y = view.y0 + (view.y1 - view.y0) * u;
+		pts.push([x, view.y0], [x, view.y1], [view.x0, y], [view.x1, y]);
+	}
+	pts.push([(view.x0 + view.x1) / 2, (view.y0 + view.y1) / 2]);
+	const sky = pts.map(([x, y]) => cam.pxToSky(x, y)).filter((q) => Number.isFinite(q[0]) && Number.isFinite(q[1]));
+	if (sky.length === 0) return out;
+
+	let decMin = Infinity, decMax = -Infinity, dMin = Infinity, dMax = -Infinity;
+	const ra0 = sky[sky.length - 1][0]; // center
+	for (const [ra, dec] of sky) {
+		decMin = Math.min(decMin, dec);
+		decMax = Math.max(decMax, dec);
+		const d = ((ra - ra0 + 540) % 360) - 180; // RA offset from the center, wrapped
+		dMin = Math.min(dMin, d);
+		dMax = Math.max(dMax, d);
+	}
+	// A celestial pole in view makes the RA range the whole circle.
+	const poleIn = (dec: number) => {
+		const q = cam.skyToPx(0, dec);
+		return !!q && q[0] >= view.x0 && q[0] <= view.x1 && q[1] >= view.y0 && q[1] <= view.y1;
+	};
+	let raMin = ra0 + dMin, raMax = ra0 + dMax;
+	if (poleIn(90) || poleIn(-90)) {
+		raMin = 0; raMax = 360;
+		if (poleIn(90)) decMax = 90;
+		if (poleIn(-90)) decMin = -90;
+	}
+
+	const decSpan = Math.max(decMax - decMin, 1e-6);
+	const raSpan = Math.max(raMax - raMin, 1e-6);
+	const decStep = pickStep(decSpan, DEC_STEPS);
+	const raStep = pickStep(raSpan, RA_STEPS);
+	const decLo = Math.max(-90, decMin - decSpan * 0.1), decHi = Math.min(90, decMax + decSpan * 0.1);
+	const raLo = raMin - raSpan * 0.1, raHi = raMax + raSpan * 0.1;
+
+	const M = 6 / 1; // label inset from the view edge, px
+	const inView = (q: [number, number]) =>
+		q[0] > view.x0 + M && q[0] < view.x1 - M && q[1] > view.y0 + M && q[1] < view.y1 - M;
+
+	const trace = (pt: (t: number) => [number, number], from: number, to: number) => {
+		const SAMPLES = 64;
+		const pieces: [number, number][][] = [];
+		let cur: [number, number][] = [];
+		for (let i = 0; i <= SAMPLES; i++) {
+			const q = cam.skyToPx(...pt(from + ((to - from) * i) / SAMPLES));
+			if (q) cur.push(q);
+			else if (cur.length) { pieces.push(cur); cur = []; }
+		}
+		if (cur.length) pieces.push(cur);
+		return pieces.filter((c) => c.length >= 2);
+	};
+
+	const MAX_LINES = 60; // guard against a runaway loop on a degenerate view
+	let count = 0;
+	for (let k = Math.ceil(decLo / decStep - 1e-9); k * decStep <= decHi + 1e-9 && count < MAX_LINES; k++, count++) {
+		const dec = k * decStep;
+		if (Math.abs(dec) >= 90 - 1e-9) continue;
+		const paths = trace((ra) => [ra, dec], raLo, raHi);
+		let at: [number, number] | null = null;
+		for (const q of paths.flat()) if (inView(q) && (!at || q[0] < at[0])) at = q;
+		if (paths.length) out.push({ paths, label: fmtDecLabel(dec, decStep), at, kind: 'dec' });
+	}
+	count = 0;
+	for (let k = Math.ceil(raLo / raStep - 1e-9); k * raStep <= raHi + 1e-9 && count < MAX_LINES; k++, count++) {
+		const ra = k * raStep;
+		const paths = trace((d) => [ra, d], Math.max(-89.999, decLo), Math.min(89.999, decHi));
+		let at: [number, number] | null = null;
+		for (const q of paths.flat()) if (inView(q) && (!at || q[1] > at[1])) at = q;
+		if (paths.length) out.push({ paths, label: fmtRaLabel(ra, raStep), at, kind: 'ra' });
+	}
+	return out;
+}
+
+/**
+ * Project every constellation for the given pointing (all angles in degrees).
+ * See `makeCamera` for the lens / geometry conventions.
+ */
+export function projectConstellations(
+	raDeg: number, decDeg: number, rollDeg: number,
+	lens: LensProfile = { f: FOCAL_LENGTH_PX },
+): ProjectedConstellation[] {
+	const { project } = makeCamera(raDeg, decDeg, rollDeg, lens);
 
 	/** Great-circle arc a→b as polyline pieces (split where projection fails). */
 	const arc = (a: V3, b: V3): [number, number][][] => {

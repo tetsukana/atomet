@@ -11,6 +11,7 @@
 //! │   ├── mask.bin
 //! │   ├── solver-db.bin
 //! │   ├── solve-lock.json
+//! │   ├── showers.csv          (optional shower-list override)
 //! │   └── sensor-cal.bin
 //! ├── logs/
 //! │   └── atomet.log[.1]
@@ -37,6 +38,12 @@ pub const SOLVER_DB_BUILTIN: &str = "/usr/share/atomet/solver-db.bin";
 /// Last validated plate solution (attitude + lens), see `wcs::Reference`.
 pub const SOLVE_LOCK: &str = "/media/mmc/config/solve-lock.json";
 pub const SENSOR_CAL: &str = "/media/mmc/config/sensor-cal.bin";
+/// Meteor-shower list (RMS `established_showers.csv` format). SD-card override
+/// first; the rootfs ships a default so the list can be updated without a rebuild.
+pub const SHOWERS_CSV: &str = "/media/mmc/config/showers.csv";
+pub const SHOWERS_CSV_BUILTIN: &str = "/usr/share/atomet/showers.csv";
+/// Clock quality written by `S43clockstat` (tmpfs).
+pub const CLOCK_JSON: &str = "/tmp/clockstat/clock.json";
 pub const WEB_OVERRIDE: &str = "/media/mmc/web";
 
 // --- Logs -------------------------------------------------------------------

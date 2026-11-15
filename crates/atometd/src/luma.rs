@@ -14,6 +14,12 @@ pub const HEIGHT: usize = 360;
 pub struct LumaFrame {
     pub data: Arc<Vec<u8>>, // WIDTH * HEIGHT bytes
     pub _idx: u64,
+    /// `IMPFrameInfo.timeStamp` as delivered by the driver. Expected to be
+    /// microseconds on a monotonic ISP clock; consumers must sanity-check the
+    /// unit against wall-clock time (see `ff::FfStacker`).
+    pub ts: i64,
+    /// `IMPFrameInfo.index`: the driver's frame counter for this channel.
+    pub hw_idx: i32,
 }
 
 /// Poll Y-plane frames from ISP channel 1 and publish via watch channel.
@@ -51,7 +57,7 @@ pub unsafe fn luma_poll_worker(
 
         // Copy Y-plane (first frame_size bytes of the NV12 buffer) into owned
         // heap storage before releasing the ISP buffer back to the driver.
-        let data = unsafe {
+        let (data, ts, hw_idx) = unsafe {
             if idx == 0 {
                 log::info!(
                     "luma frame info: width={} height={} size={} (expected {})",
@@ -61,15 +67,25 @@ pub unsafe fn luma_poll_worker(
                     WIDTH * HEIGHT * 3 / 2
                 );
             }
+            // Log the first few raw timestamps so the unit / clock can be
+            // checked on the device (expected: µs, ~40000 apart at 25 fps).
+            if idx < 4 {
+                log::info!(
+                    "luma frame {}: hw index={} timeStamp={}",
+                    idx,
+                    (*w).index,
+                    (*w).timeStamp
+                );
+            }
             let src = (*w).virAddr as *const u8;
             let mut buf = Vec::with_capacity(frame_size);
             buf.extend_from_slice(std::slice::from_raw_parts(src, frame_size));
-            Arc::new(buf)
+            (Arc::new(buf), (*w).timeStamp, (*w).index)
         };
 
         unsafe { IMP_FrameSource_ReleaseFrame(1, w) };
 
-        let frame = LumaFrame { data, _idx: idx };
+        let frame = LumaFrame { data, _idx: idx, ts, hw_idx };
         idx = idx.wrapping_add(1);
 
         // Err only when every receiver has been dropped → exit cleanly

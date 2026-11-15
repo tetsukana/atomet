@@ -550,6 +550,8 @@ impl Candidate {
     }
 }
 
+// The pattern-matcher tables and tuning knobs are passed flat on purpose.
+#[allow(clippy::too_many_arguments)]
 fn solve_inner(
     lut: &[u32],
     keys: &[u32],

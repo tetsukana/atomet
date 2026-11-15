@@ -196,10 +196,10 @@ pub async fn record_detection_task(
                         Err(e) => log::error!("Failed to create detection file '{}': {}", path.display(), e),
                     }
                 } else if recording {
-                    if let Some(muxer) = current_muxer.as_mut() {
-                        if let Err(e) = write_frame_to_muxer(muxer, &frame).await {
-                            log::error!("Failed to write video frame: {}", e);
-                        }
+                    if let Some(muxer) = current_muxer.as_mut()
+                        && let Err(e) = write_frame_to_muxer(muxer, &frame).await
+                    {
+                        log::error!("Failed to write video frame: {}", e);
                     }
 
                     if det {
@@ -227,10 +227,10 @@ pub async fn record_detection_task(
         }
     }
 
-    if let Some(muxer) = current_muxer.take() {
-        if let Err(e) = muxer.finish().await {
-            log::error!("Failed to finish detection muxer on shutdown: {}", e);
-        }
+    if let Some(muxer) = current_muxer.take()
+        && let Err(e) = muxer.finish().await
+    {
+        log::error!("Failed to finish detection muxer on shutdown: {}", e);
     }
 
     log::info!("record_detection_task shutting down");

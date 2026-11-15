@@ -86,7 +86,9 @@ pub struct AeParams {
 pub struct TopBypass {
     pub bits: [u32; 32],
 }
-// GC2053 MIPI 25fps: 1 line = 30μs
+// GC2053 MIPI: 1 line = 30μs. This is set by the horizontal timing (HTS), which
+// does not change with the frame rate: a lower fps only lengthens VTS (and so
+// the maximum exposure, vts - 4 lines), see gc2053_set_fps().
 const ONE_LINE_US: u32 = 30;
 
 /// Exposure: lines → microseconds

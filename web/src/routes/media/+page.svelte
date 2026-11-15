@@ -121,44 +121,46 @@
 	{:else}
 		<div class="file-list">
 			{#each files as f}
-				<a
-					class="file-row"
-					href={fileUrl(f.name)}
-					target="_blank"
-					rel="noopener noreferrer"
-					download={!isVideo(f.name) ? f.name : undefined}
-				>
-					<span class="file-icon">
-						{#if isVideo(f.name)}
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-								<rect x="2" y="5" width="15" height="11" rx="2" fill="#3498db"/>
-								<path d="M17 9l5-3.5v9L17 11V9z" fill="#3498db"/>
-							</svg>
-						{:else}
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-								<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
-								<polyline points="13 2 13 9 20 9"/>
-							</svg>
-						{/if}
-					</span>
-					<span class="file-name">{f.name}</span>
-					<span class="file-date">{fmtDate(f.modified)}</span>
-					<span class="file-size">{fmtSize(f.size)}</span>
-					<span class="file-action">
-						{#if isVideo(f.name)}
-							<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-								<circle cx="12" cy="12" r="10"/>
-								<polygon points="10 8 16 12 10 16 10 8"/>
-							</svg>
-						{:else}
-							<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-								<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-								<polyline points="7 10 12 15 17 10"/>
-								<line x1="12" y1="15" x2="12" y2="3"/>
-							</svg>
-						{/if}
-					</span>
-				</a>
+				<div class="file-row">
+					<a
+						class="file-main"
+						href={fileUrl(f.name)}
+						target="_blank"
+						rel="noopener noreferrer"
+						download={!isVideo(f.name) ? f.name : undefined}
+					>
+						<span class="file-icon">
+							{#if isVideo(f.name)}
+								<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+									<rect x="2" y="5" width="15" height="11" rx="2" fill="#3498db"/>
+									<path d="M17 9l5-3.5v9L17 11V9z" fill="#3498db"/>
+								</svg>
+							{:else}
+								<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+									<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+									<polyline points="13 2 13 9 20 9"/>
+								</svg>
+							{/if}
+						</span>
+						<span class="file-name">{f.name}</span>
+						<span class="file-date">{fmtDate(f.modified)}</span>
+						<span class="file-size">{fmtSize(f.size)}</span>
+					</a>
+					<!-- Videos are H.265; many phones cannot play them in-browser, so always offer a download. -->
+					<a
+						class="file-action"
+						href={fileUrl(f.name)}
+						download={f.name.split('/').pop()}
+						title={t('Download')}
+						aria-label={t('Download')}
+					>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+							<polyline points="7 10 12 15 17 10"/>
+							<line x1="12" y1="15" x2="12" y2="3"/>
+						</svg>
+					</a>
+				</div>
 			{/each}
 		</div>
 	{/if}
@@ -252,16 +254,24 @@
 	}
 
 	.file-row {
-		display: grid;
-		grid-template-columns: 20px 1fr auto auto 20px;
-		align-items: center;
-		gap: 0.75rem;
-		padding: 0.6rem 0.75rem;
+		display: flex;
+		align-items: stretch;
 		border-top: 1px solid var(--border2);
 		color: var(--text);
-		text-decoration: none;
 		font-size: 0.85rem;
 		transition: background 0.12s;
+	}
+
+	.file-main {
+		flex: 1;
+		min-width: 0;
+		display: grid;
+		grid-template-columns: 20px 1fr auto auto;
+		align-items: center;
+		gap: 0.75rem;
+		padding: 0.6rem 0 0.6rem 0.75rem;
+		color: inherit;
+		text-decoration: none;
 	}
 
 	.file-row:first-child { border-top: none; }
@@ -296,8 +306,8 @@
 		min-width: 4rem;
 	}
 
-	.file-action { display: flex; align-items: center; color: var(--text4); flex-shrink: 0; }
-	.file-row:hover .file-action { color: var(--text2); }
+	.file-action { display: flex; align-items: center; justify-content: center; min-width: 44px; color: var(--text3); flex-shrink: 0; text-decoration: none; }
+	.file-action:hover { color: var(--text); }
 
 	/* ── Detection thumbnails ───────────────── */
 	.thumb-grid {
@@ -368,8 +378,8 @@
 	@media (max-width: 480px) {
 		.page { padding: 1rem 0.75rem; }
 
-		.file-row {
-			grid-template-columns: 20px 1fr auto 20px;
+		.file-main {
+			grid-template-columns: 20px 1fr auto;
 			gap: 0.5rem;
 		}
 

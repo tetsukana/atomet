@@ -230,17 +230,22 @@ impl<W: AsyncWriteExt + AsyncSeekExt + Unpin> Mp4Muxer<W> {
         // configurationVersion = 1
         record.push(1u8);
 
-        // profile_space(2bit) | tier_flag(1bit) | profile_idc(5bit)
-        // general_profile_compatibility_flags(32bit)
-        // general_constraint_indicator_flags(48bit)
-        // general_level_idc(8bit)
-        // SPS から正確に取るのが理想だが、
-        // Main profile / Level 4.1 (組み込みHWエンコーダの典型値) で固定
-        record.push(0x01); // profile_space=0, tier=0, profile_idc=1(Main)
-        record.extend(&0x60000000u32.to_be_bytes()); // general_profile_compatibility
-        record.extend(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]); // constraint flags
-        record.push(0x00); // reserved
-        record.extend(&[0xFF, 0xFF]); // min_spatial_segmentation_idc
+        // profile_space(2) | tier_flag(1) | profile_idc(5)
+        // + general_profile_compatibility_flags(32) + constraint_indicator_flags(48)
+        // + general_level_idc(8)  = 12バイト。SPSのprofile_tier_levelをそのまま写す。
+        // (iOSはhvcCとSPSの不一致/level_idc=0を拒否するため固定値は使わない)
+        match parse_sps_ptl(&self.sps) {
+            Some(ptl) => record.extend(&ptl),
+            None => {
+                // フォールバック: Main / Level 4.1
+                record.push(0x01);
+                record.extend(&0x60000000u32.to_be_bytes());
+                record.extend(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                record.push(123); // level 4.1
+            }
+        }
+        // reserved(4bit=1111) | min_spatial_segmentation_idc(12bit)=0
+        record.extend(&[0xF0, 0x00]);
         record.push(0xFC); // parallelismType
         record.push(0xFD); // chroma_format_idc = 1 (4:2:0)
         record.push(0xF8); // bit_depth_luma - 8
@@ -368,10 +373,11 @@ fn build_stco(samples: &[Sample]) -> Vec<u8> {
 
 async fn write_ftyp<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
     let mut buf = Vec::new();
-    buf.extend(b"hvc1"); // major_brand
-    buf.extend(&0u32.to_be_bytes()); // minor_version
-    buf.extend(b"hvc1");
+    buf.extend(b"isom"); // major_brand (Apple系は hvc1 などの特殊brandを嫌う)
+    buf.extend(&0x200u32.to_be_bytes()); // minor_version
+    buf.extend(b"isom");
     buf.extend(b"iso4");
+    buf.extend(b"hvc1");
     buf.extend(b"mp41");
     w.write_all(&box_wrap(b"ftyp", &buf)).await
 }
@@ -392,7 +398,7 @@ fn build_mvhd(duration: u32, timescale: u32) -> Vec<u8> {
         0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
     ]);
     buf.extend(&[0u8; 24]); // pre_defined
-    buf.extend(&0xFFFFFFFFu32.to_be_bytes()); // next_track_ID
+    buf.extend(&2u32.to_be_bytes()); // next_track_ID (track_ID=1 の次)
     box_wrap(b"mvhd", &buf)
 }
 
@@ -443,7 +449,7 @@ fn build_hdlr() -> Vec<u8> {
 
 fn build_vmhd() -> Vec<u8> {
     let mut buf = vec![0x00, 0x00, 0x00, 0x01]; // version + flags (flags=1 per spec)
-    buf.extend(&[0u8; 4]); // graphicsMode + opcolor
+    buf.extend(&[0u8; 8]); // graphicsMode(2) + opcolor(6)。4バイトだとiOSが拒否する
     box_wrap(b"vmhd", &buf)
 }
 
@@ -480,6 +486,34 @@ fn box_wrap_with_fullheader(box_type: &[u8; 4], version: u8, flags: u32, data: &
     buf.extend(&flags.to_be_bytes()[1..]); // 3バイトのflags
     buf.extend(data);
     box_wrap(box_type, &buf)
+}
+
+/// SPS NALから profile_tier_level の先頭12バイト
+/// (profile byte, compat flags 4B, constraint flags 6B, level_idc) を取り出す。
+/// NALヘッダ(2B) + [vps_id(4)|max_sub_layers_minus1(3)|temporal_id_nesting(1)](1B) の後ろ。
+fn parse_sps_ptl(sps: &[u8]) -> Option<[u8; 12]> {
+    if sps.len() < 3 + 12 + 8 {
+        return None;
+    }
+    // エミュレーション防止バイト(00 00 03 → 00 00)を除去 (必要な先頭部分だけ)
+    let mut rbsp = Vec::with_capacity(32);
+    let mut zeros = 0;
+    for &b in sps.iter().take(48) {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let ptl = rbsp.get(3..15)?;
+    let mut out = [0u8; 12];
+    out.copy_from_slice(ptl);
+    // level_idc=0 は無効値
+    if out[11] == 0 {
+        return None;
+    }
+    Some(out)
 }
 
 /// Annex B ストリームからHEVCパラメータセット（VPS/SPS/PPS）を抽出する

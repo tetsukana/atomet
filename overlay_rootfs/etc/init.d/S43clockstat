@@ -1,0 +1,128 @@
+#!/bin/sh
+#
+# ntpd の同期状態を ntpq で定期的に採取して /tmp/clockstat/ に書き出す。
+#
+# 目的: 多点観測用に、サイドカーへ「この時計がどれだけ信用できるか」を
+# 記録したい。まずは ntpq の生の出力を残し、形式を確認してから atometd が
+# 読む JSON を決める (今は採取のみ。atometd は参照しない)。
+#
+# 出力 (tmpfs なので再起動で消える。SD カードは書かない):
+#   /tmp/clockstat/ntpq_rv.txt   最新の `ntpq -c rv` (ntpd 自身のシステム変数)
+#   /tmp/clockstat/ntpq_pe.txt   最新の `ntpq -n -c pe` (ピア一覧、offset 等)
+#   /tmp/clockstat/history.log   上記の履歴 (大きくなったら古い側を捨てる)
+#   /tmp/clockstat/clock.json    上記を整形したもの。atometd がサイドカーに入れる
+#
+
+DIR=/tmp/clockstat
+PIDFILE=/var/run/clockstat.pid
+FIRST_DELAY=60    # ntpd が最初の同期を終えるのを待つ (秒)
+INTERVAL=300      # 採取間隔 (秒)
+MAX_HISTORY=262144  # history.log の上限 (バイト)
+
+# rv の "key=value" を取り出す (キーの直前は空白かカンマ)。先頭の + は JSON で
+# 不正なので落とす。
+rv_get() {
+    v=$(echo " $RVFLAT" | sed -n "s/.*[ ,]$1=\([^, ]*\).*/\1/p" | head -n 1)
+    echo "${v#+}"
+}
+
+# 数値でなければ null にする (JSON に安全に埋め込むため)。
+num() {
+    case "$1" in
+        ''|*[!0-9.eE+-]*) echo null ;;
+        *) echo "${1#+}" ;;
+    esac
+}
+
+# ntpq の出力から clock.json を作る。atometd はこれを読んでサイドカーへ入れる。
+# 同期していない/ntpq 失敗時も synced=false で書く (古さは sampled_unix で判断)。
+write_json() {
+    RVFLAT=$(tr '\n' ' ' < "$DIR/ntpq_rv.txt")
+    synced=false
+    case "$RVFLAT" in
+        *sync_ntp*) synced=true ;;
+    esac
+    stratum=$(rv_get stratum)
+    # stratum 16 以上は未同期
+    case "$stratum" in
+        ''|*[!0-9]*) synced=false; stratum=null ;;
+        *) [ "$stratum" -ge 16 ] && synced=false ;;
+    esac
+    offset=$(num "$(rv_get offset)")
+    jitter=$(num "$(rv_get sys_jitter)")
+    rdelay=$(num "$(rv_get rootdelay)")
+    rdisp=$(num "$(rv_get rootdisp)")
+
+    # ピア: '*' = 選択中, '+' = 候補として採用
+    line=$(grep '^\*' "$DIR/ntpq_pe.txt" | head -n 1)
+    npeers=$(grep -c '^[*+]' "$DIR/ntpq_pe.txt")
+    p_remote=null; p_refid=null; p_reach=null
+    p_delay=null; p_offset=null; p_jitter=null
+    if [ -n "$line" ]; then
+        # shellcheck disable=SC2086
+        set -- ${line#\*}
+        p_remote="\"$1\""
+        p_refid="\"$2\""
+        p_reach="\"$7\""   # 8 進表記 (377 = 直近 8 回すべて成功)
+        p_delay=$(num "$8")
+        p_offset=$(num "$9")
+        p_jitter=$(num "${10}")
+    fi
+
+    cat > "$DIR/clock.json.new" <<EOF
+{"sampled_unix":$ts,"synced":$synced,"stratum":$stratum,"offset_ms":$offset,"jitter_ms":$jitter,"root_delay_ms":$rdelay,"root_disp_ms":$rdisp,"n_peers":$npeers,"peer":{"remote":$p_remote,"refid":$p_refid,"reach":$p_reach,"delay_ms":$p_delay,"offset_ms":$p_offset,"jitter_ms":$p_jitter}}
+EOF
+    mv "$DIR/clock.json.new" "$DIR/clock.json"
+}
+
+sample() {
+    ts=$(date +%s)
+    ntpq -c rv        > "$DIR/ntpq_rv.txt.new" 2>&1
+    ntpq -n -c pe     > "$DIR/ntpq_pe.txt.new" 2>&1
+    mv "$DIR/ntpq_rv.txt.new" "$DIR/ntpq_rv.txt"
+    mv "$DIR/ntpq_pe.txt.new" "$DIR/ntpq_pe.txt"
+    write_json
+    {
+        echo "=== $ts $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        cat "$DIR/ntpq_rv.txt"
+        cat "$DIR/ntpq_pe.txt"
+    } >> "$DIR/history.log"
+    size=$(wc -c < "$DIR/history.log")
+    if [ "$size" -gt "$MAX_HISTORY" ]; then
+        tail -c $((MAX_HISTORY / 2)) "$DIR/history.log" > "$DIR/history.log.new"
+        mv "$DIR/history.log.new" "$DIR/history.log"
+    fi
+}
+
+loop() {
+    sleep "$FIRST_DELAY"
+    while true; do
+        sample
+        sleep "$INTERVAL"
+    done
+}
+
+case "$1" in
+    start)
+        echo "Starting clockstat..."
+        mkdir -p "$DIR"
+        loop &
+        echo $! > "$PIDFILE"
+        echo "OK"
+        ;;
+    stop)
+        echo "Stopping clockstat..."
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+        echo "OK"
+        ;;
+    restart|reload)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

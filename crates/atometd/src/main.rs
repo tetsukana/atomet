@@ -1,4 +1,5 @@
 pub mod ae_ctrl;
+mod clockstat;
 mod config;
 mod daynight;
 mod detection;
@@ -12,6 +13,7 @@ mod muxer;
 mod osd;
 mod paths;
 mod record;
+mod showers;
 mod solve;
 mod stream;
 mod system;
@@ -172,7 +174,7 @@ async fn main() {
 
         // Disable ISP digital gain (cap to 0 = 1x)
         match crate::ae_ctrl::AtometDev::open() {
-            Ok(dev) => {
+            Ok(_dev) => {
                 /*if let Err(e) = dev.set_max_idg(256) {
                     log::error!("Failed to disable ISP DG: {}", e);
                 } else {
@@ -293,11 +295,14 @@ async fn main() {
 
     // Detection debug broadcast channel
     let (detection_tx, _) = broadcast::channel::<String>(32);
+    // Meteor-only events (no per-frame debug stream) for the FF saver.
+    let (meteor_tx, _) = broadcast::channel::<String>(32);
 
     // Detection task
     let shutdown_clone = Arc::clone(&shutdown);
     let app_state_clone = Arc::clone(&app_state);
     let detection_tx_clone = detection_tx.clone();
+    let meteor_tx_clone = meteor_tx.clone();
     let luma_rx_detection = luma_rx.clone();
     let mask_clone = Arc::clone(&mask_data);
     let detection_active_clone = Arc::clone(&detection_active);
@@ -309,6 +314,7 @@ async fn main() {
             shutdown_clone,
             wd_detection,
             detection_tx_clone,
+            meteor_tx_clone,
             mask_clone,
             detection_active_clone,
             detection_tracking_clone,
@@ -320,18 +326,17 @@ async fn main() {
     let (ff_block_tx, ff_block_rx) = mpsc::channel::<ff::FfBlock>(2);
     let luma_rx_ff = luma_rx.clone();
     let shutdown_clone = Arc::clone(&shutdown);
+    let app_state_ff = Arc::clone(&app_state);
     tokio::task::spawn_blocking(move || {
-        ff::ff_stack_worker(luma_rx_ff, ff_block_tx, shutdown_clone, wd_ff_stack);
+        ff::ff_stack_worker(luma_rx_ff, ff_block_tx, shutdown_clone, wd_ff_stack, app_state_ff);
     });
 
-    // Plate solver database — shared by the FF saver (automatic solve) and
-    // the on-demand /api/solve web handlers.
+    // Plate solver database, used by the FF saver (automatic solve).
     let solver_db = Arc::new(solve::load_database());
-    let latest_stars = Arc::new(arc_swap::ArcSwapOption::<ff::LatestStars>::empty());
 
     // FF smart saver: saves detected / interesting / baseline blocks.
     let (ff_event_tx, _) = broadcast::channel::<String>(16);
-    let ff_detection_rx = detection_tx.subscribe();
+    let ff_detection_rx = meteor_tx.subscribe();
     let shutdown_clone = Arc::clone(&shutdown);
     tokio::spawn(ff::ff_save_smart_task(
         ff_block_rx,
@@ -340,7 +345,6 @@ async fn main() {
         shutdown_clone,
         Arc::clone(&mask_data),
         Arc::clone(&solver_db),
-        Arc::clone(&latest_stars),
         app_state_data.fps,
         Arc::clone(&app_state),
     ));
@@ -407,15 +411,11 @@ async fn main() {
     // 11. axum server on port 80
     let web_state = web::WebState {
         app_state,
-        shutdown,
         sysstat_tx,
         detection_tx,
         ff_tx: ff_event_tx,
         mask: Arc::clone(&mask_data),
         webhook_tx: webhook_event_tx,
-        luma_rx: luma_rx.clone(),
-        solver_db,
-        latest_stars,
     };
     let app = web::build_router(web_state);
 

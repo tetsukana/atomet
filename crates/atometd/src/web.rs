@@ -10,33 +10,23 @@ use axum::routing::get;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use crate::config::SharedAppState;
-use crate::luma;
 use crate::paths;
 use crate::webhook::WebhookEvent;
 use crate::websocket;
-use solver::Database;
 
 /// Shared state passed to axum handlers via `with_state`.
 #[derive(Clone)]
 pub struct WebState {
     pub app_state: SharedAppState,
-    pub shutdown: Arc<AtomicBool>,
     pub sysstat_tx: broadcast::Sender<String>,
     pub detection_tx: broadcast::Sender<String>,
     pub ff_tx: broadcast::Sender<String>,
     pub mask: Arc<ArcSwap<Vec<u8>>>,
     pub webhook_tx: tokio::sync::mpsc::Sender<WebhookEvent>,
-    /// Latest luma frame (640×360 Y-plane), for on-demand still capture.
-    pub luma_rx: watch::Receiver<Option<luma::LumaFrame>>,
-    /// Plate solver database (shared with the realtime solve task).
-    pub solver_db: Arc<Option<Database>>,
-    /// Stars from the latest FF block (what the automatic solve used).
-    pub latest_stars: Arc<arc_swap::ArcSwapOption<crate::ff::LatestStars>>,
 }
 
 /// Build the axum router.
@@ -49,8 +39,6 @@ pub fn build_router(state: WebState) -> Router {
         .route("/api/state", get(api_get_state))
         .route("/api/files", get(api_list_files))
         .route("/api/mask", get(api_get_mask).put(api_put_mask))
-        .route("/api/solve/capture", get(api_solve_capture))
-        .route("/api/solve", axum::routing::post(api_solve))
         .nest_service("/files/records", ServeDir::new(paths::RECORDS_DIR))
         .nest_service("/files/timelapse", ServeDir::new(paths::TIMELAPSE_DIR))
         .nest_service("/files/detections", ServeDir::new(paths::DETECTIONS_DIR))
@@ -215,110 +203,6 @@ async fn api_put_mask(
         Err(e) => {
             log::error!("Failed to save mask: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        }
-    }
-}
-
-/// Return the latest FF block's mean frame together with its extracted stars.
-///
-/// A binary blob so the image and its star list come from the *same*
-/// frame:
-///   bytes 0..4      : u32 little-endian metadata length L
-///   bytes 4..4+L    : UTF-8 JSON { width, height, threshold, stars:[[x,y,flux],…] }
-///   bytes 4+L..     : raw WIDTH×HEIGHT Y-plane — the latest FF block's mean frame
-async fn api_solve_capture(
-    axum::extract::State(state): axum::extract::State<WebState>,
-) -> Response<axum::body::Body> {
-    // Serve the latest FF block's mean frame and the stars the automatic
-    // solve used, so the page and the solver always agree.
-    let Some(latest) = state.latest_stars.load_full() else {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(axum::body::Body::from("no FF block yet — wait for the next block"))
-            .unwrap();
-    };
-
-    let stars_json: Vec<String> = latest
-        .stars
-        .iter()
-        .map(|s| format!("[{:.1},{:.1},{}]", s[0], s[1], s[2] as u32))
-        .collect();
-    let meta = format!(
-        r#"{{"width":{},"height":{},"threshold":{},"stars":[{}]}}"#,
-        luma::WIDTH,
-        luma::HEIGHT,
-        latest.threshold,
-        stars_json.join(","),
-    );
-
-    let meta_bytes = meta.into_bytes();
-    let mut body = Vec::with_capacity(4 + meta_bytes.len() + latest.avepixel.len());
-    body.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
-    body.extend_from_slice(&meta_bytes);
-    body.extend_from_slice(&latest.avepixel);
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(axum::body::Body::from(body))
-        .unwrap()
-}
-
-/// Plate-solve an edited star list. Body: `{ "stars": [[x,y], …] }` in 640×360 px.
-async fn api_solve(
-    axum::extract::State(state): axum::extract::State<WebState>,
-    axum::Json(body): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    if state.solver_db.is_none() {
-        return axum::Json(serde_json::json!({
-            "ok": false,
-            "error": "solver database not loaded",
-        }));
-    }
-
-    let stars_px: Vec<(f32, f32)> = body
-        .get("stars")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    let p = p.as_array()?;
-                    let x = p.first()?.as_f64()? as f32;
-                    let y = p.get(1)?.as_f64()? as f32;
-                    Some((x, y))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if stars_px.len() < 4 {
-        return axum::Json(serde_json::json!({
-            "ok": false,
-            "error": "need at least 4 stars",
-            "count": stars_px.len(),
-        }));
-    }
-
-    let db = Arc::clone(&state.solver_db);
-    let result = tokio::task::spawn_blocking(move || {
-        crate::solve::solve_stars(db.as_ref().as_ref().unwrap(), &stars_px, None)
-    })
-    .await;
-
-    match result {
-        Ok(Some(o)) => axum::Json(serde_json::json!({
-            "ok": true,
-            "ra": o.ra,
-            "dec": o.dec,
-            "roll": o.roll,
-            "votes": o.votes,
-            "matched": o.matched,
-            "outer": o.outer,
-            "rms": o.rms_px,
-        })),
-        Ok(None) => axum::Json(serde_json::json!({ "ok": true, "solution": null })),
-        Err(e) => {
-            log::error!("solve task panicked: {}", e);
-            axum::Json(serde_json::json!({ "ok": false, "error": "solve task panicked" }))
         }
     }
 }

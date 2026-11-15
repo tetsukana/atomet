@@ -8,7 +8,6 @@ const ja: Record<string, string> = {
 	'Live': 'ライブ',
 	'Media': 'メディア',
 	'Mask': 'マスク',
-	'Solve': 'ソルブ',
 	'Settings': '設定',
 	'Switch to light mode': 'ライトモードに切替',
 	'Switch to dark mode': 'ダークモードに切替',
@@ -99,6 +98,19 @@ const ja: Record<string, string> = {
 	'min': '分',
 	'h': '時間',
 	'Recalibrate': '再キャリブレーション',
+	'Cancel': 'キャンセル',
+	'No calibration data yet': '校正データはまだありません',
+	'Pointing': '向き',
+	'Roll': 'ロール',
+	'Focal length': '焦点距離',
+	'Lens model': 'レンズモデル',
+	'Polynomial': '多項式',
+	'Pinhole': 'ピンホール',
+	'Calibration': 'キャリブレーション',
+	'Recalibration requested': '再キャリブレーションを要求しました',
+	'Use this after moving the camera. It recalibrates automatically within the schedule.':
+		'カメラを動かしたときに使います。スケジュールの時間内に、自動で再校正されます。',
+	'Turn on the plate solver to recalibrate': '再校正にはプレートソルバーを有効にしてください',
 	'Discard the saved solution and calibrate again?': '保存済みの解を破棄して、もう一度キャリブレーションしますか?',
 	'Enable Plate Solver': 'プレートソルバーを有効化',
 	'Mode': 'モード',
@@ -126,8 +138,11 @@ const ja: Record<string, string> = {
 
 	// Sidebar misc
 	'Debug overlay': 'デバッグ表示',
-	'Star overlay': '恒星表示',
 	'Constellation overlay': '星座表示',
+	'Frame rate': 'フレームレート',
+	'low light': '暗所向け',
+	'Grid overlay': '赤道座標グリッド',
+	'Cursor readout': 'カーソル位置表示',
 	'No plate solution': 'プレートソルブ結果なし',
 	'HISTOGRAM': 'ヒストグラム',
 	'Capture FITS': 'FITSスナップショット',
@@ -139,6 +154,7 @@ const ja: Record<string, string> = {
 	'Records': '録画',
 	'Detections': '検出',
 	'Refresh': '更新',
+	'Download': 'ダウンロード',
 	'Loading…': '読み込み中…',
 	'No files in': '次の場所にファイルなし:',
 	'files': '件',
@@ -157,17 +173,6 @@ const ja: Record<string, string> = {
 	'Saving...': '保存中…',
 	'Click/drag to mask. Right-click/Ctrl+click or Erase mode to unmask.':
 		'クリック/ドラッグでマスク。右クリック・Ctrl+クリックまたは消去モードでマスク解除。ズーム時は「移動」でスクロール。',
-
-	// Solve page
-	'Star Editor': '恒星エディタ',
-	'stars': '個の恒星',
-	'Capturing…': '撮影中…',
-	'Solving…': 'ソルブ中…',
-	'Need at least 4 stars': '恒星が4個以上必要です',
-	'Capture a frame, then click empty space to add a star or click a marker to remove it. Need ≥ 4 stars to solve.':
-		'フレームを撮影し、空白をクリックで恒星を追加、マーカーをクリックで削除。ソルブには4個以上必要です。',
-	'Press Capture to grab a frame': '「撮影」を押してフレームを取得',
-	'No solution found': '解が見つかりませんでした',
 
 	// Logs
 	'Log': 'ログ',

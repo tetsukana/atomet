@@ -84,8 +84,8 @@ impl Saved {
             && self.f.is_finite()
             && self.f > 0.0
             && (n - 1.0).abs() < 1e-3
-            && self.c3.map_or(true, f64::is_finite)
-            && self.c5.map_or(true, f64::is_finite)
+            && self.c3.is_none_or(f64::is_finite)
+            && self.c5.is_none_or(f64::is_finite)
     }
 }
 
@@ -161,9 +161,27 @@ impl Reference {
     pub fn status_json(&self, now: f64, enabled: bool, in_schedule: bool) -> String {
         let age = self.current.as_ref().map(|s| (now - s.verified).max(0.0));
         let retry_in = (self.due(now) && self.burst_left == 0 && now < self.retry_after)
-            .then(|| self.retry_after - now);
+            .then_some(self.retry_after - now);
+        // The locked reference advanced to `now`, so the UI can draw the sky
+        // overlay without a running solver. Same units as the `stars` event's
+        // `solve` (degrees); the lens omits c3/c5 for a pinhole.
+        let pose = self.at(now).map(|(p, l, _)| {
+            let [x, y, z] = p.pointing;
+            let mut lens = serde_json::json!({ "f": l.f });
+            if let Shape::Poly { c3, c5 } = l.shape {
+                lens["c3"] = c3.into();
+                lens["c5"] = c5.into();
+            }
+            serde_json::json!({
+                "ra": y.atan2(x).to_degrees().rem_euclid(360.0),
+                "dec": z.clamp(-1.0, 1.0).asin().to_degrees(),
+                "roll": p.roll.to_degrees(),
+                "lens": lens,
+            })
+        });
         serde_json::json!({
             "type": "solver_status",
+            "pose": pose,
             "enabled": enabled,
             "in_schedule": in_schedule,
             "has_ref": self.current.is_some(),
@@ -271,8 +289,8 @@ fn mean_pose(samples: &[(Pose, LensModel, f64)], t_ref: f64) -> Pose {
     let (mut p, mut s, mut c) = ([0.0f64; 3], 0.0f64, 0.0f64);
     for (pose, _, t) in samples {
         let q = advance_pose(pose, t_ref - t);
-        for i in 0..3 {
-            p[i] += q.pointing[i];
+        for (acc, v) in p.iter_mut().zip(q.pointing) {
+            *acc += v;
         }
         s += pose.roll.sin();
         c += pose.roll.cos();
@@ -460,13 +478,11 @@ mod tests {
         // Ten-second blocks, nothing ever solves.
         while t < 6.0 * 3600.0 {
             let was_idle = r.burst_left == 0;
-            if r.should_try(t) {
-                if was_idle {
-                    if !last_start.is_nan() {
-                        starts.push(t - last_start);
-                    }
-                    last_start = t;
+            if r.should_try(t) && was_idle {
+                if !last_start.is_nan() {
+                    starts.push(t - last_start);
                 }
+                last_start = t;
             }
             t += 10.0;
         }

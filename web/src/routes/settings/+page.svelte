@@ -1,12 +1,45 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { AtometWebSocket } from '$lib/ws';
-	import type { AppState } from '$lib/types';
+	import type { AppState, SolverStatus } from '$lib/types';
 	import { t } from '$lib/i18n';
+	import { solverLine, fmtRa, fmtDec } from '$lib/solver';
 
 	let ws: AtometWebSocket;
 	let appState = $state<AppState | null>(null);
 	let wsConnected = $state(false);
+
+	// ── Plate-solver calibration card ───────────────────────────────────────
+	let solverStatus = $state<SolverStatus | null>(null);
+	const solverState = $derived(solverLine(solverStatus));
+	const calibPct = $derived(
+		solverStatus && solverStatus.need > 0
+			? Math.min(100, Math.round((solverStatus.samples / solverStatus.need) * 100))
+			: 0,
+	);
+	// Two-step confirm without a native dialog: the first click arms the button,
+	// the second one sends. It disarms itself after a few seconds.
+	let recalArmed = $state(false);
+	let recalNote = $state(false);
+	let recalTimer: ReturnType<typeof setTimeout> | undefined;
+	let noteTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function armRecalibrate() {
+		recalArmed = true;
+		clearTimeout(recalTimer);
+		recalTimer = setTimeout(() => { recalArmed = false; }, 6000);
+	}
+	function cancelRecalibrate() {
+		recalArmed = false;
+		clearTimeout(recalTimer);
+	}
+	function doRecalibrate() {
+		cancelRecalibrate();
+		send('solver_recalibrate', true);
+		recalNote = true;
+		clearTimeout(noteTimer);
+		noteTimer = setTimeout(() => { recalNote = false; }, 10000);
+	}
 
 	type Tab = 'system' | 'detection' | 'record' | 'image' | 'webhook';
 	let activeTab = $state<Tab>('system');
@@ -72,6 +105,7 @@
 		ws.onStatusChange = (c) => { wsConnected = c; };
 		ws.onAppState     = (s) => { appState = s; };
 		ws.onBypass       = (bits) => { bypassBits = bits; };
+		ws.onSolverStatus = (s) => { solverStatus = s; };
 		ws.connect();
 	});
 
@@ -87,7 +121,11 @@
 		}
 	});
 
-	onDestroy(() => ws?.disconnect());
+	onDestroy(() => {
+		clearTimeout(recalTimer);
+		clearTimeout(noteTimer);
+		ws?.disconnect();
+	});
 
 	function send(type: string, value: unknown) {
 		ws?.send({ type, value });
@@ -419,11 +457,50 @@
 						</div>
 					</div>
 					{/if}
-					<div class="row">
-						<span>{t('Camera moved?')}</span>
-						<button onclick={() => { if (confirm(t('Discard the saved solution and calibrate again?'))) send('solver_recalibrate', true); }}>
-							{t('Recalibrate')}
-						</button>
+				</section>
+
+				<section>
+					<h2>{t('Calibration')}</h2>
+					<div class="calib {solverState[1]}">
+						<div class="calib-head">
+							<span class="calib-dot" aria-hidden="true"></span>
+							<span class="calib-title">{solverState[0] || t('No calibration data yet')}</span>
+						</div>
+
+						{#if solverStatus && !solverStatus.has_ref && solverStatus.samples > 0}
+							<div class="calib-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={calibPct}>
+								<div style="width:{calibPct}%"></div>
+							</div>
+						{/if}
+
+						{#if solverStatus?.pose}
+							{@const p = solverStatus.pose}
+							<dl class="calib-grid">
+								<div><dt>RA</dt><dd>{fmtRa(p.ra)}</dd></div>
+								<div><dt>Dec</dt><dd>{fmtDec(p.dec)}</dd></div>
+								<div><dt>{t('Roll')}</dt><dd>{p.roll.toFixed(1)}°</dd></div>
+								<div><dt>{t('Focal length')}</dt><dd>{p.lens.f.toFixed(0)} px</dd></div>
+								<div><dt>{t('Lens model')}</dt><dd>{p.lens.c3 !== undefined ? t('Polynomial') : t('Pinhole')}</dd></div>
+							</dl>
+						{/if}
+
+						<div class="calib-actions">
+							{#if recalArmed}
+								<span class="calib-warn">{t('Discard the saved solution and calibrate again?')}</span>
+								<button class="btn ghost" onclick={cancelRecalibrate}>{t('Cancel')}</button>
+								<button class="btn danger" onclick={doRecalibrate}>{t('Recalibrate')}</button>
+							{:else}
+								<button class="btn outline" onclick={armRecalibrate}
+									disabled={!appState.solver_enabled}
+									title={appState.solver_enabled ? '' : t('Turn on the plate solver to recalibrate')}>
+									{t('Recalibrate')}
+								</button>
+								{#if recalNote}
+									<span class="calib-note">✓ {t('Recalibration requested')}</span>
+								{/if}
+							{/if}
+						</div>
+						<p class="hint">{t('Use this after moving the camera. It recalibrates automatically within the schedule.')}</p>
 					</div>
 				</section>
 
@@ -735,16 +812,6 @@
 		max-width: 240px;
 	}
 
-	.slider-wrap input[type="range"] {
-		flex: 1;
-		height: 4px;
-		appearance: none;
-		background: var(--toggle-off);
-		border-radius: 2px;
-		cursor: pointer;
-		accent-color: #3498db;
-	}
-
 	.slider-val {
 		font-size: 0.8rem;
 		color: var(--text2);
@@ -908,10 +975,120 @@
 		line-height: 1.5;
 	}
 
-	section.disabled {
-		opacity: 0.4;
-		pointer-events: none;
+	/* ── Plate-solver calibration card ──────── */
+	.calib {
+		--accent: var(--text3);
+		display: flex;
+		flex-direction: column;
+		gap: 0.85rem;
+		padding: 0.9rem 1rem;
+		background: var(--card);
+		border: 1px solid var(--border);
+		border-left: 3px solid var(--accent);
+		border-radius: 8px;
 	}
+	.calib.ok   { --accent: #4caf78; }
+	.calib.work { --accent: #6aa9ff; }
+	.calib.warn { --accent: #f90; }
+
+	.calib-head {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		font-size: 0.9rem;
+		color: var(--text);
+	}
+	.calib-dot {
+		width: 9px;
+		height: 9px;
+		border-radius: 50%;
+		background: var(--accent);
+		flex-shrink: 0;
+	}
+	.calib.work .calib-dot { animation: calib-pulse 1.4s ease-in-out infinite; }
+	@keyframes calib-pulse {
+		50% { opacity: 0.35; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.calib.work .calib-dot { animation: none; }
+	}
+
+	.calib-bar {
+		height: 4px;
+		background: var(--toggle-off);
+		border-radius: 2px;
+		overflow: hidden;
+	}
+	.calib-bar > div {
+		height: 100%;
+		background: var(--accent);
+		transition: width 0.4s;
+	}
+
+	.calib-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
+		gap: 0.6rem 1rem;
+		margin: 0;
+	}
+	.calib-grid > div { min-width: 0; }
+	.calib-grid dt {
+		font-size: 0.68rem;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--text3);
+	}
+	.calib-grid dd {
+		margin: 0.1rem 0 0;
+		font-size: 0.85rem;
+		font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+		color: var(--text);
+	}
+
+	.calib-actions {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.6rem;
+	}
+	.calib-warn {
+		flex: 1 1 14rem;
+		font-size: 0.82rem;
+		color: #f90;
+	}
+	.calib-note {
+		font-size: 0.8rem;
+		color: #4caf78;
+	}
+	.calib .hint { margin: 0; }
+
+	.btn {
+		padding: 0.45rem 0.95rem;
+		border-radius: 6px;
+		border: 1px solid transparent;
+		font-size: 0.85rem;
+		font-weight: 500;
+		cursor: pointer;
+		transition: background 0.15s, border-color 0.15s, color 0.15s;
+	}
+	.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+	.btn:focus-visible { outline: 2px solid #6aa9ff; outline-offset: 2px; }
+	.btn.outline {
+		background: transparent;
+		border-color: var(--border);
+		color: var(--text);
+	}
+	.btn.outline:hover:not(:disabled) { background: var(--hover); border-color: var(--text3); }
+	.btn.ghost {
+		background: transparent;
+		color: var(--text3);
+	}
+	.btn.ghost:hover { color: var(--text); background: var(--hover); }
+	.btn.danger {
+		background: #c0392b;
+		color: #fff;
+	}
+	.btn.danger:hover { background: #d94536; }
 
 	/* ── Mobile ─────────────────────────────── */
 	@media (max-width: 480px) {
