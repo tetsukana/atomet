@@ -20,10 +20,20 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
         let _ = sender.send(Message::Text(text)).await;
     }
 
-    let app_state = state.app_state.clone();
+    // Subscribe before replaying history so no event falls in the gap
+    // (a duplicate is harmless: the client dedups by id/path).
     let mut sysstat_rx = state.sysstat_tx.subscribe();
     let mut detection_rx = state.detection_tx.subscribe();
     let mut ff_rx = state.ff_tx.subscribe();
+
+    // Replay this detection period's events so the logs survive tab switches.
+    for msg in state.history.snapshot() {
+        if sender.send(Message::Text(msg)).await.is_err() {
+            return;
+        }
+    }
+
+    let app_state = state.app_state.clone();
 
     loop {
         tokio::select! {
@@ -385,6 +395,14 @@ async fn handle_command(
             {
                 state.scheduled_reboot_hour = h as u32;
                 log::info!("Scheduled reboot hour = {}", h);
+            }
+        }
+        "set_scheduled_reboot_minute" => {
+            if let Some(m) = cmd.get("value").and_then(|v| v.as_u64())
+                && m < 60
+            {
+                state.scheduled_reboot_minute = m as u32;
+                log::info!("Scheduled reboot minute = {}", m);
             }
         }
         "set_bypass" => {

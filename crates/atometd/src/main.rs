@@ -7,6 +7,7 @@ mod ff;
 mod fits;
 mod font;
 mod gpio;
+mod history;
 mod isp;
 mod luma;
 mod muxer;
@@ -408,8 +409,19 @@ async fn main() {
         }
     });
 
+    // Event history for reconnecting web clients
+    let event_history = history::EventHistory::default();
+    tokio::spawn(history::history_task(
+        event_history.clone(),
+        detection_tx.subscribe(),
+        ff_event_tx.subscribe(),
+        Arc::clone(&app_state),
+        Arc::clone(&shutdown),
+    ));
+
     // 11. axum server on port 80
     let web_state = web::WebState {
+        history: event_history,
         app_state,
         sysstat_tx,
         detection_tx,

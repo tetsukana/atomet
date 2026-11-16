@@ -56,8 +56,8 @@ pub async fn scheduled_reboot_task(app_state: SharedAppState, shutdown: Arc<Atom
             continue;
         }
         let now = chrono::Local::now();
-        if now.hour() == s.scheduled_reboot_hour && now.minute() == 0 {
-            log::info!("Scheduled reboot trigger ({}:00 local)", now.hour());
+        if now.hour() == s.scheduled_reboot_hour && now.minute() == s.scheduled_reboot_minute {
+            log::info!("Scheduled reboot trigger ({:02}:{:02} local)", now.hour(), now.minute());
             reboot();
             break;
         }

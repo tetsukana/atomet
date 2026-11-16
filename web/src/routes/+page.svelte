@@ -118,10 +118,10 @@
     let width = 0;
     let height = 0;
 
-	const MAX_METEOR_LOG = 20;
+	const MAX_METEOR_LOG = 500;
 	let meteorLog = $state<MeteorEvent[]>([]);
 
-	const MAX_FF_LOG = 30;
+	const MAX_FF_LOG = 500;
 	let ffLog = $state<FfSavedEvent[]>([]);
 
 	$effect(() => {
@@ -165,6 +165,8 @@
 		}
 		ws.onDetectionDebug = (d) => { detectionDebug = d; };
 		ws.onMeteorEvent = (e) => {
+			// History replay on (re)connect may overlap with live events.
+			if (meteorLog.some((m) => m.id === e.id && m.ts === e.ts)) return;
 			meteorLog = [e, ...meteorLog.slice(0, MAX_METEOR_LOG - 1)];
 		};
 		ws.onMeteorEnd = (e) => {
@@ -172,6 +174,7 @@
 			meteorLog = meteorLog.map((m) => (m.id === e.id ? e : m));
 		};
 		ws.onFfSaved = (e) => {
+			if (ffLog.some((f) => f.path === e.path)) return;
 			ffLog = [e, ...ffLog.slice(0, MAX_FF_LOG - 1)];
 		};
 		ws.onStars = (e) => { starsEvent = e; };

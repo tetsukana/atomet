@@ -22,6 +22,7 @@ use crate::websocket;
 #[derive(Clone)]
 pub struct WebState {
     pub app_state: SharedAppState,
+    pub history: crate::history::EventHistory,
     pub sysstat_tx: broadcast::Sender<String>,
     pub detection_tx: broadcast::Sender<String>,
     pub ff_tx: broadcast::Sender<String>,

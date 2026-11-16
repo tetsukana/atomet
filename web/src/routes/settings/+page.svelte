@@ -9,6 +9,18 @@
 	let appState = $state<AppState | null>(null);
 	let wsConnected = $state(false);
 
+	// Reboot inside the detection period loses that night's log. Exact for a
+	// fixed-hour schedule; twilight schedules vary by date, so warn when enabled.
+	const rebootOverlapsDetection = $derived.by(() => {
+		const a = appState;
+		if (!a?.scheduled_reboot_enabled || !a.detection_enabled) return false;
+		if (a.detection_use_twilight) return true;
+		const h = a.scheduled_reboot_hour;
+		const start = a.detection_start_hour;
+		const end = a.detection_end_hour > 24 ? a.detection_end_hour - 24 : a.detection_end_hour;
+		return start <= end ? h >= start && h < end : h >= start || h < end;
+	});
+
 	// ── Plate-solver calibration card ───────────────────────────────────────
 	let solverStatus = $state<SolverStatus | null>(null);
 	const solverState = $derived(solverLine(solverStatus));
@@ -363,14 +375,24 @@
 					{#if appState.scheduled_reboot_enabled}
 						<label class="row">
 							<span>{t('Reboot time')}</span>
-							<div class="select-wrap">
+							<div class="select-wrap" style="display:flex;gap:0.3rem;align-items:center">
 								<select onchange={(e) => send('set_scheduled_reboot_hour', +e.currentTarget.value)}>
 									{#each Array.from({length: 24}, (_, i) => i) as h}
-										<option value={h} selected={appState.scheduled_reboot_hour === h}>{`${String(h).padStart(2, '0')}:00`}</option>
+										<option value={h} selected={appState.scheduled_reboot_hour === h}>{String(h).padStart(2, '0')}</option>
+									{/each}
+								</select>
+								:
+								<select onchange={(e) => send('set_scheduled_reboot_minute', +e.currentTarget.value)}>
+									{#each Array.from({length: 60}, (_, i) => i) as m}
+										<option value={m} selected={(appState.scheduled_reboot_minute ?? 0) === m}>{String(m).padStart(2, '0')}</option>
 									{/each}
 								</select>
 							</div>
 						</label>
+						<p class="hint">{t('Rebooting restarts the process and resets the detection log. Choose a time outside the detection period.')}</p>
+						{#if rebootOverlapsDetection}
+							<p class="hint" style="color:#f80">{t('Warning: this time may fall inside the detection period.')}</p>
+						{/if}
 					{/if}
 				</section>
 

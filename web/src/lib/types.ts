@@ -89,6 +89,7 @@ export interface AppState {
 	detection_twilight_astro: boolean;
 	scheduled_reboot_enabled: boolean;
 	scheduled_reboot_hour: number;
+	scheduled_reboot_minute: number;
 	auto_ircut: boolean;
 	auto_irled: boolean;
 	isp_bypass: number[];

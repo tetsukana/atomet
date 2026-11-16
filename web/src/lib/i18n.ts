@@ -25,6 +25,8 @@ const ja: Record<string, string> = {
 	'Maintenance': 'メンテナンス',
 	'Daily auto-reboot': '毎日の自動再起動',
 	'Reboot time': '再起動時刻',
+	'Rebooting restarts the process and resets the detection log. Choose a time outside the detection period.': '再起動するとプロセスが再起動され、検出ログはリセットされます。検出期間外の時刻を推奨します。',
+	'Warning: this time may fall inside the detection period.': '警告: この時刻は検出期間内に入っている可能性があります。',
 	'Auto': '自動',
 	'On': 'ON',
 	'Off': 'OFF',

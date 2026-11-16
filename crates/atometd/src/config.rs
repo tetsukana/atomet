@@ -72,12 +72,14 @@ pub struct AppState {
     pub record_twilight_astro: bool,
     pub timelapse_twilight_astro: bool,
     pub detection_twilight_astro: bool,
-    /// If true, atometd triggers a `reboot` at `scheduled_reboot_hour:00` once
+    /// If true, atometd triggers a `reboot` at `scheduled_reboot_hour:scheduled_reboot_minute` once
     /// per day. Guard rails: only fires when uptime > 5 min and only inside the
-    /// first minute of the target hour.
+    /// target minute.
     pub scheduled_reboot_enabled: bool,
     /// Local hour (0–23) at which the daily reboot fires.
     pub scheduled_reboot_hour: u32,
+    /// Local minute (0–59) at which the daily reboot fires.
+    pub scheduled_reboot_minute: u32,
     /// When true, daynight task drives IR Cut (off at night / on at day).
     pub auto_ircut: bool,
     /// When true, daynight task drives IR LED (on at night / off at day).
@@ -136,6 +138,7 @@ impl Default for AppState {
             detection_twilight_astro: false,
             scheduled_reboot_enabled: false,
             scheduled_reboot_hour: 4,
+            scheduled_reboot_minute: 0,
             auto_ircut: true,
             auto_irled: false,
             isp_bypass: Vec::new(),
@@ -344,6 +347,8 @@ pub struct PersistConfig {
     pub scheduled_reboot_enabled: bool,
     #[serde(default = "default_reboot_hour")]
     pub scheduled_reboot_hour: u32,
+    #[serde(default)]
+    pub scheduled_reboot_minute: u32,
     #[serde(default = "default_true")]
     pub auto_ircut: bool,
     #[serde(default)]
@@ -417,6 +422,7 @@ impl From<&AppState> for PersistConfig {
             detection_twilight_astro: s.detection_twilight_astro,
             scheduled_reboot_enabled: s.scheduled_reboot_enabled,
             scheduled_reboot_hour: s.scheduled_reboot_hour,
+            scheduled_reboot_minute: s.scheduled_reboot_minute,
             auto_ircut: s.auto_ircut,
             auto_irled: s.auto_irled,
             isp_bypass: s.isp_bypass.clone(),
@@ -465,6 +471,7 @@ impl AppState {
             detection_twilight_astro: cfg.detection_twilight_astro,
             scheduled_reboot_enabled: cfg.scheduled_reboot_enabled,
             scheduled_reboot_hour: cfg.scheduled_reboot_hour,
+            scheduled_reboot_minute: cfg.scheduled_reboot_minute.min(59),
             auto_ircut: cfg.auto_ircut,
             auto_irled: cfg.auto_irled,
             isp_bypass: cfg.isp_bypass,
