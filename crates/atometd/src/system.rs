@@ -227,6 +227,16 @@ pub async fn ispstat_broadcast_task(tx: broadcast::Sender<String>, shutdown: Arc
         isp_info.min_ag = isp_gain_to_db10(ae.min_ag);
         isp_info.min_sdg = isp_gain_to_db10(ae.min_sdg);
         isp_info.min_idg = isp_gain_to_db10(ae.min_idg);
+        crate::ae_ctrl::publish_ae(crate::ae_ctrl::AeSnapshot {
+            taken: std::time::Instant::now(),
+            ae_mode: ae.ae_mode,
+            it_lines: ae.it_value,
+            it_us: lines_to_us(ae.it_value),
+            ag_db10: isp_gain_to_db10(ae.ag_value),
+            sdg_db10: isp_gain_to_db10(ae.sdg_value),
+            idg_db10: isp_gain_to_db10(ae.idg_value),
+            total_db10: isp_gain_to_db10(ae.total_gain_log2),
+        });
         isp_info.fps_actual = crate::ff::measured_fps_rounded();
         isp_info.histogram = histogram.to_vec();
 

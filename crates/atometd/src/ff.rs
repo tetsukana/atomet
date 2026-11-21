@@ -14,39 +14,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 pub const FRAMES_PER_BLOCK: u32 = 256;
 const N: usize = luma::WIDTH * luma::HEIGHT;
 
-/// A finalized FF (Four-Field) block: 4 derived images over a 256-frame window.
-///
-/// `maxpixel`/`maxframe` together let you reconstruct the brightest event at
-/// every pixel and *when* it occurred (frame index 0..=255).
-/// `avepixel`/`stdpixel` are the per-pixel temporal mean and stddev — used
-/// downstream for σ-clip detection: `maxpixel > avepixel + K·stdpixel`.
-pub struct FfBlock {
-    pub maxpixel: Vec<u8>,
-    pub maxframe: Vec<u8>,
-    pub avepixel: Vec<u8>,
-    pub stdpixel: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub start_ts: SystemTime,
-    pub n_frames: u32,
-    /// Measured time from the first to the last frame of the block, seconds
-    /// (0 = unknown). Covers `n_frames - 1` frame intervals.
-    pub duration_s: f64,
-    /// Measured frames per second of the frames that were stacked,
-    /// `(n_frames - 1) / duration_s` (0 = unknown). This is the rate that
-    /// matters for `maxframe` (a stacked frame is one step in time).
-    pub fps_eff: f64,
-    /// Frames the driver produced but the stacker never saw (from the
-    /// driver's frame counter; 0 if the counter was not usable).
-    pub dropped: u32,
-    /// The configured fps changed while this block was being stacked, so its
-    /// time axis is not uniform: skip time-based detection on it.
-    pub mixed_fps: bool,
-    /// Configured fps at the end of the block.
-    pub cfg_fps: u32,
-    /// Where `duration_s` came from: "hw" (driver timestamps) or "wall".
-    pub timing_src: &'static str,
-}
+pub use crate::ff_detect::{AeInfo, FF_REF_FPS, FfBlock, FfMeteor, ff_detect_meteor};
 
 /// Measured fps of the latest block, in thousandths of a frame per second
 /// (0 = none yet). Feeds `fps_actual` in the UI.
@@ -199,6 +167,16 @@ impl FfStacker {
             mixed_fps: self.mixed_fps,
             cfg_fps: self.last_cfg_fps,
             timing_src,
+            ae: crate::ae_ctrl::latest_ae().map(|s| AeInfo {
+                ae_mode: s.ae_mode,
+                it_lines: s.it_lines,
+                it_us: s.it_us,
+                ag_db10: s.ag_db10,
+                sdg_db10: s.sdg_db10,
+                idg_db10: s.idg_db10,
+                total_db10: s.total_db10,
+                age_s: s.taken.elapsed().as_secs_f32(),
+            }),
         };
         self.sum.fill(0);
         self.sum_sq.fill(0);
@@ -273,277 +251,6 @@ pub fn ff_stack_worker(
     }
 
     log::info!("FF stack worker stopped");
-}
-
-// σ-clip threshold multiplier: pixel flagged when maxpixel > avepixel + K * stdpixel
-const SIGMA_K: f32 = 5.0;
-// Minimum flagged pixels to consider a block "interesting"
-const MIN_INTERESTING_PIXELS: usize = 10;
-
-/// Returns true if the block contains a statistically anomalous bright transient.
-///
-/// Uses per-pixel σ-clip: flag pixel i when `maxpixel[i] > avepixel[i] + K * stdpixel[i]`.
-/// stdpixel = 0 means σ < 1 ADU (very stable pixel); treat as σ = 1 so bright
-/// meteors still get flagged against flat-dark skies.
-pub fn ff_is_interesting(block: &FfBlock) -> bool {
-    let n = (block.width * block.height) as usize;
-    let mut count = 0usize;
-    for i in 0..n {
-        let max = block.maxpixel[i] as f32;
-        let ave = block.avepixel[i] as f32;
-        let std = (block.stdpixel[i] as f32).max(1.0);
-        if max > ave + SIGMA_K * std {
-            count += 1;
-            if count >= MIN_INTERESTING_PIXELS {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-// ============================================================
-// FF second-pass meteor detection
-// ============================================================
-//
-// σ-clip flags pixels where maxpixel ≫ avepixel over the 256-frame block;
-// a meteor leaves a *line* of flagged pixels whose maxframe (the frame
-// index where each pixel peaked) advances monotonically along the line.
-// Integrating over the whole block makes this far more sensitive than the
-// per-frame realtime path. Discriminators:
-//   - stars / noise: no linear spatial structure
-//   - lightning / illumination steps: everything peaks at the same frame
-//     (no time gradient) or floods the pixel cap
-//   - satellites / aircraft: linear with a time gradient, but slow
-//     (low px/frame along the line)
-
-/// Minimum flagged pixels in one connected cluster.
-const FF_DET_MIN_PIXELS: usize = 12;
-/// Absolute floor on `maxpixel - avepixel` (ADU). `stdpixel` is uint8-quantised,
-/// so `5σ` alone is ≈ noise level on a dark/cloudy sky and flags thousands of
-/// pixels; a real meteor streak is far brighter than this.
-const FF_DET_MIN_EXCESS: f32 = 15.0;
-/// More flagged pixels *in total* than this = lightning / illumination step
-/// (a flood no streak analysis can untangle). With the excess floor, clouds
-/// and noise flag only a few hundred pixels.
-const FF_DET_MAX_PIXELS: usize = 20_000;
-/// Keep at most this many clusters (largest first).
-const FF_DET_MAX_METEORS: usize = 8;
-const FF_DET_MIN_LINEARITY: f32 = 5.0;
-const FF_DET_MIN_LEN_PX: f32 = 12.0;
-/// |Pearson r| between position along the line and maxframe.
-const FF_DET_MIN_TIME_CORR: f32 = 0.8;
-/// Apparent speed floor (px/frame) at FF_REF_FPS. Satellites take the whole
-/// block (~10 s) to cross and fall well below this. Scaled to the configured
-/// fps in `ff_detect_meteor` so the floor stays the same in px/s.
-const FF_DET_MIN_SPEED_PX: f32 = 0.8;
-/// Frame rate FF_DET_MIN_SPEED_PX was set at.
-const FF_REF_FPS: f32 = 25.0;
-
-// Detection mask cell grid (must match detection.rs / the mask editor)
-const MASK_CELL_SIZE: usize = 8;
-const MASK_CELLS_X: usize = luma::WIDTH / MASK_CELL_SIZE; // 80
-
-/// Result of FF second-pass meteor detection.
-pub struct FfMeteor {
-    /// Line endpoints in 640×360 px, earliest end first.
-    pub x0: f32,
-    pub y0: f32,
-    pub x1: f32,
-    pub y1: f32,
-    pub length: f32,
-    /// maxframe span covered by the event (frames).
-    pub frames: u32,
-    /// Apparent speed along the line, px/frame.
-    pub speed: f32,
-    /// Number of σ-clipped pixels in the cluster.
-    pub pixels: usize,
-    /// Pearson correlation between line position and maxframe.
-    pub time_corr: f32,
-    /// maxframe at the earliest / latest end of the cluster.
-    pub f0: f32,
-    pub f1: f32,
-}
-
-/// Detect meteors in a finalized FF block (see module notes above).
-/// `cell_mask` is the 80×45 detection mask (non-zero = masked).
-///
-/// Flagged pixels are split into 8-connected clusters (after a 1 px dilation
-/// that bridges gaps in a faint streak) and each cluster is judged on its own
-/// (line shape, maxframe gradient, speed). Judging the whole frame at once
-/// fails as soon as clouds or noise flag scattered pixels around the streak.
-/// Returns the accepted clusters, largest first.
-pub fn ff_detect_meteor(block: &FfBlock, cell_mask: &[u8], fps: f32) -> Vec<FfMeteor> {
-    let w = block.width as usize;
-    let h = block.height as usize;
-
-    // σ-clip with an absolute excess floor (outside masked cells).
-    let mut flag = vec![false; w * h];
-    let mut total = 0usize;
-    for y in 0..h {
-        let mask_row = y / MASK_CELL_SIZE * MASK_CELLS_X;
-        for x in 0..w {
-            if cell_mask[mask_row + x / MASK_CELL_SIZE] != 0 {
-                continue;
-            }
-            let i = y * w + x;
-            let max = block.maxpixel[i] as f32;
-            let ave = block.avepixel[i] as f32;
-            let std = (block.stdpixel[i] as f32).max(1.0);
-            let excess = max - ave;
-            if excess > SIGMA_K * std && excess > FF_DET_MIN_EXCESS {
-                flag[i] = true;
-                total += 1;
-                if total > FF_DET_MAX_PIXELS {
-                    return Vec::new();
-                }
-            }
-        }
-    }
-    if total < FF_DET_MIN_PIXELS {
-        return Vec::new();
-    }
-
-    // 3×3 dilation: connectivity only; cluster members stay the flagged pixels.
-    let mut grow = flag.clone();
-    for y in 0..h {
-        for x in 0..w {
-            if !flag[y * w + x] {
-                continue;
-            }
-            for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
-                for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
-                    grow[ny * w + nx] = true;
-                }
-            }
-        }
-    }
-
-    // Flood-fill labelling of the dilated mask.
-    let mut seen = vec![false; w * h];
-    let mut stack: Vec<usize> = Vec::new();
-    let mut out: Vec<FfMeteor> = Vec::new();
-    for start in 0..w * h {
-        if !grow[start] || seen[start] {
-            continue;
-        }
-        seen[start] = true;
-        stack.push(start);
-        let mut pts: Vec<(f32, f32, f32)> = Vec::new(); // (x, y, maxframe)
-        while let Some(i) = stack.pop() {
-            let (x, y) = (i % w, i / w);
-            if flag[i] {
-                pts.push((x as f32, y as f32, block.maxframe[i] as f32));
-            }
-            for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
-                for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
-                    let j = ny * w + nx;
-                    if grow[j] && !seen[j] {
-                        seen[j] = true;
-                        stack.push(j);
-                    }
-                }
-            }
-        }
-        if pts.len() >= FF_DET_MIN_PIXELS
-            && let Some(m) = analyze_cluster(&pts, fps)
-        {
-            out.push(m);
-        }
-    }
-    out.sort_by_key(|m| std::cmp::Reverse(m.pixels));
-    out.truncate(FF_DET_MAX_METEORS);
-    out
-}
-
-/// Judge one cluster of flagged pixels `(x, y, maxframe)`: line shape,
-/// maxframe gradient along the line, and apparent speed.
-fn analyze_cluster(pts: &[(f32, f32, f32)], fps: f32) -> Option<FfMeteor> {
-    // PCA line fit on flagged pixel positions
-    let n = pts.len() as f32;
-    let mx = pts.iter().map(|p| p.0).sum::<f32>() / n;
-    let my = pts.iter().map(|p| p.1).sum::<f32>() / n;
-    let (mut sxx, mut sxy, mut syy) = (0f32, 0f32, 0f32);
-    for &(x, y, _) in pts {
-        let dx = x - mx;
-        let dy = y - my;
-        sxx += dx * dx;
-        sxy += dx * dy;
-        syy += dy * dy;
-    }
-    sxx /= n;
-    sxy /= n;
-    syy /= n;
-
-    let trace = sxx + syy;
-    let det = sxx * syy - sxy * sxy;
-    let disc = ((trace * trace / 4.0) - det).max(0.0).sqrt();
-    let l1 = trace / 2.0 + disc;
-    let l2 = (trace / 2.0 - disc).max(0.0625); // (0.5 px)² floor
-    let length = (12.0 * l1).sqrt();
-    if l1 / l2 < FF_DET_MIN_LINEARITY || length < FF_DET_MIN_LEN_PX {
-        return None;
-    }
-    let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
-    let (ux, uy) = (theta.cos(), theta.sin());
-
-    // Temporal propagation: maxframe must correlate with position along
-    // the line. A lightning flash flags many pixels at one frame (sff ≈ 0).
-    let mf = pts.iter().map(|p| p.2).sum::<f32>() / n;
-    let (mut spp, mut spf, mut sff) = (0f32, 0f32, 0f32);
-    let mut pr_min = f32::MAX;
-    let mut pr_max = f32::MIN;
-    let mut f_min = f32::MAX;
-    let mut f_max = f32::MIN;
-    for &(x, y, f) in pts {
-        let pr = (x - mx) * ux + (y - my) * uy;
-        let df = f - mf;
-        spp += pr * pr;
-        spf += pr * df;
-        sff += df * df;
-        pr_min = pr_min.min(pr);
-        pr_max = pr_max.max(pr);
-        f_min = f_min.min(f);
-        f_max = f_max.max(f);
-    }
-    if spp <= 0.0 || sff <= 0.0 {
-        return None;
-    }
-    let r = spf / (spp * sff).sqrt();
-    if r.abs() < FF_DET_MIN_TIME_CORR {
-        return None;
-    }
-
-    // Apparent speed along the line (satellite/aircraft guard)
-    let span = (f_max - f_min).max(1.0);
-    let speed = length / span;
-    // Same px/s floor at any frame rate (unchanged at FF_REF_FPS).
-    let min_speed = FF_DET_MIN_SPEED_PX * FF_REF_FPS / fps.clamp(1.0, 60.0);
-    if speed < min_speed {
-        return None;
-    }
-
-    // Endpoints from projection extremes, oriented earliest-end first
-    let (mut x0, mut y0) = (mx + ux * pr_min, my + uy * pr_min);
-    let (mut x1, mut y1) = (mx + ux * pr_max, my + uy * pr_max);
-    if r < 0.0 {
-        std::mem::swap(&mut x0, &mut x1);
-        std::mem::swap(&mut y0, &mut y1);
-    }
-
-    Some(FfMeteor {
-        x0,
-        y0,
-        x1,
-        y1,
-        length,
-        frames: span as u32,
-        speed,
-        pixels: pts.len(),
-        time_corr: r,
-        f0: f_min,
-        f1: f_max,
-    })
 }
 
 /// WCS stamped into a block: FITS cards plus the attitude/lens they came from
@@ -646,6 +353,19 @@ pub fn ff_block_to_fits(block: &FfBlock, wcs: &[Vec<u8>]) -> Vec<u8> {
     common_cards.push(fits::card_int("CFGFPS", block.cfg_fps as i64));
     common_cards.push(fits::card_int("DROPPED", block.dropped as i64));
     common_cards.push(fits::card_bool("MIXEDFPS", block.mixed_fps));
+    // Auto-exposure state at the end of the block: noise follows gain.
+    if let Some(a) = &block.ae {
+        common_cards.push(fits::card_float("EXPTIME", a.it_us as f64 / 1e6));
+        common_cards.push(fits::card_float("GAINDB", a.total_db10 as f64 / 10.0));
+        common_cards.push(fits::card_float("AGAINDB", a.ag_db10 as f64 / 10.0));
+        common_cards.push(fits::card_float("SDGAINDB", a.sdg_db10 as f64 / 10.0));
+        common_cards.push(fits::card_float("IDGAINDB", a.idg_db10 as f64 / 10.0));
+        common_cards.push(fits::card_int("AEMODE", a.ae_mode as i64));
+    }
+    // ISP TOP_BYPASS words (index 0 first, '1' = module bypassed; index 12 = BCSH): BCSH off doubled the noise.
+    if let Some(bp) = crate::ae_ctrl::latest_bypass() {
+        common_cards.push(fits::card_str("ISPBYP", &crate::ae_ctrl::bypass_string(&bp)));
+    }
     // Plate-solution WCS (ZPN) — same pixel grid in every HDU.
     common_cards.extend(wcs.iter().cloned());
 
@@ -726,9 +446,11 @@ pub fn save_ff_sidecar(fits_path: &std::path::Path, mut meta: serde_json::Value)
 /// Smart FF save task.
 ///
 /// Saves a block when ANY of the following is true:
-///   - `detection_rx` received at least one event during this block (detected transient)
-///   - σ-clip analysis flags the block as interesting (bright anomaly)
+///   - `detection_rx` received at least one event during this block, or the FF
+///     pass found a meteor (detected)
 ///   - One block per hour has not yet been saved (calibration baseline)
+///   - `ff_save_all` (validation mode) is on: every block is kept, so the
+///     detectors' misses can be measured offline
 ///
 /// Detected blocks go under `ff/detections/`; others under `ff/`.
 /// FITS I/O is handed to `spawn_blocking` to avoid stalling the async runtime.
@@ -765,6 +487,10 @@ pub async fn ff_save_smart_task(
     // The solver only runs to build / re-verify it.
     let now_unix = Utc::now().timestamp_millis() as f64 / 1000.0;
     let reference = Arc::new(std::sync::Mutex::new(crate::wcs::Reference::load(now_unix)));
+    // A restart must not lose the lens: seed the prior from the stored reference.
+    if let Some(l) = reference.lock().unwrap().lens() {
+        *lens_prior.lock().unwrap() = Some(l);
+    }
     let mut ff_meteor_seq: u32 = 0;
     // Realtime meteor events seen while the current block accumulated.
     let mut rt_events: Vec<serde_json::Value> = Vec::new();
@@ -1014,8 +740,8 @@ pub async fn ff_save_smart_task(
                 for m in &ff_meteors {
                     ff_meteor_seq += 1;
                     log::info!(
-                        "FF meteor: len={:.0}px frames={} speed={:.1}px/f corr={:.2} pixels={}",
-                        m.length, m.frames, m.speed, m.time_corr, m.pixels
+                        "FF meteor [{}]: len={:.0}px frames={} speed={:.1}px/f corr={:.2} pixels={} exc={}",
+                        m.tier.as_str(), m.length, m.frames, m.speed, m.time_corr, m.pixels, m.excess
                     );
                     let evt = serde_json::json!({
                         "type": "meteor",
@@ -1027,24 +753,25 @@ pub async fn ff_save_smart_task(
                         "trajectory": [[m.x0, m.y0], [m.x1, m.y1]],
                         "ts": dt.format("%Y%m%d_%H%M%S").to_string(),
                         "ff": true,
+                        "tier": m.tier.as_str(),
                     });
                     let _ = ff_tx.send(evt.to_string());
                 }
 
                 let detected  = had_detection || !ff_meteors.is_empty();
-                let interesting = ff_is_interesting(&block);
+                let save_all = app_state.load().ff_save_all;
                 let this_hour = (dt.year(), dt.month() * 100 + dt.day(), dt.hour());
                 let is_baseline = last_baseline != Some(this_hour);
 
-                let should_save = detected || interesting || is_baseline;
+                let should_save = detected || is_baseline || save_all;
 
                 if should_save {
                     if is_baseline {
                         last_baseline = Some(this_hour);
                     }
                     let reason = if detected { "detected" }
-                                 else if interesting { "interesting" }
-                                 else { "baseline" };
+                                 else if is_baseline { "baseline" }
+                                 else { "validation" };
                     log::info!(
                         "FF saving block ({}) start={}",
                         reason,
@@ -1068,6 +795,9 @@ pub async fn ff_save_smart_task(
                     let sidecar = detected.then(|| {
                         serde_json::json!({
                             "version": 1,
+                            // Detector generation: ff-tier-v1 = confidence tiers A/B/C
+                            // (see FF_TIERS); sidecars without it are tier-A-only.
+                            "detector": "ff-tier-v1",
                             "block_start": dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
                             "n_frames": block.n_frames,
                             "fps_config": block.cfg_fps,
@@ -1077,6 +807,18 @@ pub async fn ff_save_smart_task(
                             "mixed_fps": block.mixed_fps,
                             "timing_src": block.timing_src,
                             "clock": crate::clockstat::read(),
+                            // Camera AE state at the end of the block (gain in dB, exposure in µs and sensor lines).
+                            "ae": block.ae.map(|a| serde_json::json!({
+                                "exposure_us": a.it_us,
+                                "exposure_lines": a.it_lines,
+                                "gain_db": a.total_db10 as f64 / 10.0,
+                                "again_db": a.ag_db10 as f64 / 10.0,
+                                "sdg_db": a.sdg_db10 as f64 / 10.0,
+                                "idg_db": a.idg_db10 as f64 / 10.0,
+                                "mode": a.ae_mode,
+                                "age_s": a.age_s,
+                            })),
+                            "isp_bypass": crate::ae_ctrl::latest_bypass().map(|b| crate::ae_ctrl::bypass_string(&b)),
                             "shower_catalog": shower_cat.map(|c| c.info.clone()),
                             "reason": reason,
                             "wcs": !wcs_cards.is_empty(),
@@ -1089,6 +831,8 @@ pub async fn ff_save_smart_task(
                                     "pixels": m.pixels,
                                     "time_corr": m.time_corr,
                                     "f0": m.f0, "f1": m.f1,
+                                    "tier": m.tier.as_str(),
+                                    "excess": m.excess,
                                 });
                                 if let Some((pose, lens)) = &block_wcs.geom
                                     && let Some(sky) = meteor_sky(m, pose, lens, block.fps_eff as f32, shower_cat, block_unix)
@@ -1129,7 +873,7 @@ pub async fn ff_save_smart_task(
                         Err(e) => log::error!("FF save task panicked: {}", e),
                     }
                 } else {
-                    log::debug!("FF block skipped (not interesting)");
+                    log::debug!("FF block skipped (no detection)");
                 }
 
                 had_detection = false;
@@ -1149,116 +893,4 @@ pub async fn ff_save_smart_task(
         }
     }
     log::info!("FF save task stopped");
-}
-
-#[cfg(test)]
-mod ff_detect_tests {
-    use super::*;
-
-    const W: usize = 640;
-    const H: usize = 360;
-
-    fn blank_block() -> FfBlock {
-        FfBlock {
-            maxpixel: vec![102; W * H],
-            maxframe: vec![0; W * H],
-            avepixel: vec![100; W * H],
-            stdpixel: vec![2; W * H],
-            width: W as u32,
-            height: H as u32,
-            start_ts: SystemTime::UNIX_EPOCH,
-            n_frames: 256,
-            duration_s: 10.2,
-            fps_eff: 25.0,
-            dropped: 0,
-            mixed_fps: false,
-            cfg_fps: 25,
-            timing_src: "hw",
-        }
-    }
-
-    /// Draw a streak (x0,y0)→(x1,y1) peaking at frame `f0..f1`.
-    fn add_streak(b: &mut FfBlock, (x0, y0): (f32, f32), (x1, y1): (f32, f32), f0: f32, f1: f32) {
-        let n = 80;
-        for k in 0..=n {
-            let t = k as f32 / n as f32;
-            let x = (x0 + (x1 - x0) * t).round() as usize;
-            let y = (y0 + (y1 - y0) * t).round() as usize;
-            let i = y * W + x;
-            b.maxpixel[i] = 240;
-            b.maxframe[i] = (f0 + (f1 - f0) * t).round() as u8;
-        }
-    }
-
-    /// Deterministic scattered "cloud/noise" pixels above 5σ (but weak).
-    fn add_scatter(b: &mut FfBlock, count: usize) {
-        let mut s: u32 = 12345;
-        for _ in 0..count {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            let x = (s >> 8) as usize % W;
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            let y = (s >> 8) as usize % H;
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            let i = y * W + x;
-            if b.maxpixel[i] < 200 {
-                b.maxpixel[i] = 100 + 11; // 5.5σ, excess 11 < floor 15
-            }
-            b.maxframe[i] = (s >> 24) as u8;
-        }
-    }
-
-    fn open_mask() -> Vec<u8> {
-        vec![0u8; MASK_CELLS_X * (H / MASK_CELL_SIZE)]
-    }
-
-    #[test]
-    fn finds_streak_amid_scatter() {
-        let mut b = blank_block();
-        add_scatter(&mut b, 15_000); // far above the old 4000-pixel cap
-        add_streak(&mut b, (206.0, 193.0), (152.0, 205.0), 184.0, 199.0);
-        let found = ff_detect_meteor(&b, &open_mask(), 25.0);
-        assert_eq!(found.len(), 1, "expected exactly the streak");
-        let m = &found[0];
-        assert!((m.length - 55.0).abs() < 8.0, "length {}", m.length);
-        // earliest end first → x0 is the right end (frame 184 at x=206)
-        assert!(m.x0 > m.x1, "direction: x0={} x1={}", m.x0, m.x1);
-        assert!(m.speed > 2.0 && m.speed < 5.0, "speed {}", m.speed);
-    }
-
-    #[test]
-    fn scatter_alone_is_not_a_meteor() {
-        let mut b = blank_block();
-        add_scatter(&mut b, 15_000);
-        assert!(ff_detect_meteor(&b, &open_mask(), 25.0).is_empty());
-    }
-
-    #[test]
-    fn two_streaks_both_reported() {
-        let mut b = blank_block();
-        add_streak(&mut b, (100.0, 50.0), (150.0, 60.0), 30.0, 45.0);
-        add_streak(&mut b, (400.0, 300.0), (360.0, 250.0), 120.0, 135.0);
-        let found = ff_detect_meteor(&b, &open_mask(), 25.0);
-        assert_eq!(found.len(), 2);
-    }
-
-    #[test]
-    fn simultaneous_flash_is_rejected() {
-        // Everything peaks at the same frame: no time gradient.
-        let mut b = blank_block();
-        add_streak(&mut b, (100.0, 50.0), (160.0, 50.0), 77.0, 77.0);
-        assert!(ff_detect_meteor(&b, &open_mask(), 25.0).is_empty());
-    }
-
-    #[test]
-    fn masked_cells_are_ignored() {
-        let mut b = blank_block();
-        add_streak(&mut b, (200.0, 192.0), (152.0, 200.0), 184.0, 199.0);
-        let mut mask = open_mask();
-        for cx in 15..28 {
-            for cy in 22..27 {
-                mask[cy * MASK_CELLS_X + cx] = 1;
-            }
-        }
-        assert!(ff_detect_meteor(&b, &mask, 25.0).is_empty());
-    }
 }

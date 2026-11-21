@@ -4,6 +4,7 @@ mod config;
 mod daynight;
 mod detection;
 mod ff;
+mod ff_detect;
 mod fits;
 mod font;
 mod gpio;
@@ -81,7 +82,9 @@ async fn main() {
     log::info!("atometd starting");
 
     // 2. Load config
-    let app_state_data = load_config().await;
+    let mut app_state_data = load_config().await;
+    // Keep the stored/displayed state in line with what is applied below.
+    ae_ctrl::pin_bcsh_on(&mut app_state_data.isp_bypass);
     system::apply_timezone(&app_state_data.timezone);
     // Re-apply persisted ISP bypass bits before any frame is captured.
     if app_state_data.isp_bypass.len() == 32 {
@@ -98,6 +101,13 @@ async fn main() {
                 }
             }
             Err(e) => log::warn!("ISP bypass restore skipped (cannot open /dev/atomet): {}", e),
+        }
+    }
+    // Record the bypass state actually in the kernel (also when nothing was restored) for the FF FITS/sidecar.
+    if let Ok(dev) = ae_ctrl::AtometDev::open() {
+        match dev.get_bypass() {
+            Ok(bp) => ae_ctrl::publish_bypass(bp.bits),
+            Err(e) => log::warn!("get_bypass for FF metadata failed: {}", e),
         }
     }
     let app_state: SharedAppState = Arc::new(ArcSwap::from_pointee(app_state_data.clone()));

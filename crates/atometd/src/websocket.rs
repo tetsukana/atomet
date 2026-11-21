@@ -405,6 +405,15 @@ async fn handle_command(
                 log::info!("Scheduled reboot minute = {}", m);
             }
         }
+        "set_ff_save_all" => {
+            if let Some(on) = cmd.get("value").and_then(|v| v.as_bool()) {
+                state.ff_save_all = on;
+                log::info!(
+                    "FF save mode: {}",
+                    if on { "all blocks (validation)" } else { "detected + hourly baseline" }
+                );
+            }
+        }
         "set_bypass" => {
             let resp = ioctl_set_bypass(cmd.get("bits").and_then(|v| v.as_array()));
             // Mirror into AppState only on success, then fall through to the
@@ -503,9 +512,11 @@ fn ioctl_set_bypass(bits: Option<&Vec<serde_json::Value>>) -> String {
     for (i, v) in arr.iter().enumerate() {
         bp.bits[i] = v.as_u64().unwrap_or(0) as u32;
     }
+    crate::ae_ctrl::pin_bcsh_on(&mut bp.bits);
     let resp = match crate::ae_ctrl::AtometDev::open() {
         Ok(dev) => match dev.set_bypass(&bp) {
             Ok(()) => {
+                crate::ae_ctrl::publish_bypass(bp.bits);
                 log::info!("Bypass set: {:?}", &bp.bits[..8]);
                 serde_json::json!({ "type": "bypass", "bits": bp.bits.to_vec() })
             }

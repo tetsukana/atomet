@@ -86,10 +86,71 @@ pub struct AeParams {
 pub struct TopBypass {
     pub bits: [u32; 32],
 }
+
+/// TOP_BYPASS bit of CLM/BCSH. It is pinned ON (0 = module active): with it bypassed the temporal noise doubled at the same
+/// gain (2026-11-19/20 night: 12-18% of sky pixels over the FF detector levels; see docs/ff-artificial-meteor-plan.md).
+pub const BCSH_BIT: usize = 12;
+
+/// Force the BCSH bit on; returns true if it had to be changed.
+pub fn pin_bcsh_on(bits: &mut [u32]) -> bool {
+    match bits.get_mut(BCSH_BIT) {
+        Some(b) if *b != 0 => {
+            *b = 0;
+            true
+        }
+        _ => false,
+    }
+}
 // GC2053 MIPI: 1 line = 30μs. This is set by the horizontal timing (HTS), which
 // does not change with the frame rate: a lower fps only lengthens VTS (and so
 // the maximum exposure, vts - 4 lines), see gc2053_set_fps().
 const ONE_LINE_US: u32 = 30;
+
+/// Auto-exposure state at one instant, in the units the sidecar/FITS record.
+#[derive(Clone, Copy, Debug)]
+pub struct AeSnapshot {
+    pub taken: std::time::Instant,
+    pub ae_mode: u32,
+    pub it_lines: u32,
+    pub it_us: u32,
+    pub ag_db10: u32,
+    pub sdg_db10: u32,
+    pub idg_db10: u32,
+    pub total_db10: u32,
+}
+
+static AE_LATEST: std::sync::Mutex<Option<AeSnapshot>> = std::sync::Mutex::new(None);
+
+/// Called by the ISP stat task (4 Hz) so other tasks can read the AE state without an ioctl of their own.
+pub fn publish_ae(s: AeSnapshot) {
+    if let Ok(mut g) = AE_LATEST.lock() {
+        *g = Some(s);
+    }
+}
+
+/// Most recent published AE state (`None` before the first sample).
+pub fn latest_ae() -> Option<AeSnapshot> {
+    AE_LATEST.lock().ok().and_then(|g| *g)
+}
+
+static ISP_BYPASS_LATEST: std::sync::Mutex<Option<[u32; 32]>> = std::sync::Mutex::new(None);
+
+/// Remember the ISP TOP_BYPASS words last read from / written to the kernel, so FF blocks can record them.
+pub fn publish_bypass(bits: [u32; 32]) {
+    if let Ok(mut g) = ISP_BYPASS_LATEST.lock() {
+        *g = Some(bits);
+    }
+}
+
+/// Last known ISP bypass words (`None` until the first read at startup).
+pub fn latest_bypass() -> Option<[u32; 32]> {
+    ISP_BYPASS_LATEST.lock().ok().and_then(|g| *g)
+}
+
+/// Bypass words as a 32-char string of '0'/'1' (index 0 first; '1' = module bypassed).
+pub fn bypass_string(bits: &[u32; 32]) -> String {
+    bits.iter().map(|&b| if b != 0 { '1' } else { '0' }).collect()
+}
 
 /// Exposure: lines → microseconds
 pub fn lines_to_us(lines: u32) -> u32 {

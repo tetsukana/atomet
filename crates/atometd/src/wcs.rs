@@ -147,6 +147,11 @@ impl Reference {
         st
     }
 
+    /// Lens of the loaded reference (seeds the solver's lens prior after a restart).
+    pub fn lens(&self) -> Option<LensModel> {
+        self.current.as_ref().map(Saved::lens)
+    }
+
     /// Drop the reference and any collected samples.
     pub fn reset(&mut self) {
         self.current = None;

@@ -80,6 +80,10 @@ pub struct AppState {
     pub scheduled_reboot_hour: u32,
     /// Local minute (0–59) at which the daily reboot fires.
     pub scheduled_reboot_minute: u32,
+    /// FF validation mode: save every FF block (to `ff/`), not only the ones
+    /// with a detection. Off (default) = detected blocks + one baseline block
+    /// per hour. Used to measure the detectors' misses offline.
+    pub ff_save_all: bool,
     /// When true, daynight task drives IR Cut (off at night / on at day).
     pub auto_ircut: bool,
     /// When true, daynight task drives IR LED (on at night / off at day).
@@ -139,6 +143,7 @@ impl Default for AppState {
             scheduled_reboot_enabled: false,
             scheduled_reboot_hour: 4,
             scheduled_reboot_minute: 0,
+            ff_save_all: false,
             auto_ircut: true,
             auto_irled: false,
             isp_bypass: Vec::new(),
@@ -349,6 +354,8 @@ pub struct PersistConfig {
     pub scheduled_reboot_hour: u32,
     #[serde(default)]
     pub scheduled_reboot_minute: u32,
+    #[serde(default)]
+    pub ff_save_all: bool,
     #[serde(default = "default_true")]
     pub auto_ircut: bool,
     #[serde(default)]
@@ -423,6 +430,7 @@ impl From<&AppState> for PersistConfig {
             scheduled_reboot_enabled: s.scheduled_reboot_enabled,
             scheduled_reboot_hour: s.scheduled_reboot_hour,
             scheduled_reboot_minute: s.scheduled_reboot_minute,
+            ff_save_all: s.ff_save_all,
             auto_ircut: s.auto_ircut,
             auto_irled: s.auto_irled,
             isp_bypass: s.isp_bypass.clone(),
@@ -472,6 +480,7 @@ impl AppState {
             scheduled_reboot_enabled: cfg.scheduled_reboot_enabled,
             scheduled_reboot_hour: cfg.scheduled_reboot_hour,
             scheduled_reboot_minute: cfg.scheduled_reboot_minute.min(59),
+            ff_save_all: cfg.ff_save_all,
             auto_ircut: cfg.auto_ircut,
             auto_irled: cfg.auto_irled,
             isp_bypass: cfg.isp_bypass,
@@ -522,23 +531,61 @@ pub struct IspInfo {
     pub histogram: Vec<u32>,
 }
 
+/// Last known-good copy of the config, kept next to it.
+fn backup_path() -> String {
+    format!("{}.bak", paths::CONFIG_TOML)
+}
+
+/// Top-level key count of a TOML document (None if it does not parse as a table).
+fn toml_key_count(text: &str) -> Option<usize> {
+    text.parse::<toml::Table>().ok().map(|t| t.len())
+}
+
+/// A config file that parses *and* still has most of its keys. Every key has a
+/// serde default, so a truncated file parses fine and silently resets whatever
+/// was cut off; comparing the key count with the backup catches that.
+fn read_valid_config(text: &str, reference_keys: Option<usize>) -> Result<PersistConfig, String> {
+    let keys = toml_key_count(text).ok_or("not a TOML table")?;
+    if let Some(r) = reference_keys
+        && keys * 10 < r * 7
+    {
+        return Err(format!("only {keys} keys, backup has {r} (truncated?)"));
+    }
+    toml::from_str::<PersistConfig>(text).map_err(|e| e.to_string())
+}
+
 pub async fn load_config() -> AppState {
     let path = Path::new(paths::CONFIG_TOML);
+    let bak = backup_path();
+    let bak_text = tokio::fs::read_to_string(&bak).await.ok();
+    let bak_keys = bak_text.as_deref().and_then(toml_key_count);
     if path.exists() {
         match tokio::fs::read_to_string(path).await {
-            Ok(contents) => match toml::from_str::<PersistConfig>(&contents) {
+            Ok(contents) => match read_valid_config(&contents, bak_keys) {
                 Ok(cfg) => {
                     log::info!("Loaded config from {}", paths::CONFIG_TOML);
                     return AppState::with_config(cfg);
                 }
-                Err(e) => log::warn!("Failed to parse config: {}", e),
+                Err(e) => log::error!("Config {} rejected: {}", paths::CONFIG_TOML, e),
             },
             Err(e) => log::warn!("Failed to read config: {}", e),
+        }
+    }
+    if let Some(text) = bak_text {
+        match read_valid_config(&text, None) {
+            Ok(cfg) => {
+                log::warn!("Restored config from backup {}", bak);
+                return AppState::with_config(cfg);
+            }
+            Err(e) => log::error!("Backup {} unusable: {}", bak, e),
         }
     }
     log::info!("Using default config");
     AppState::default()
 }
+
+/// Saves are serialized: they share one temp file name.
+static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Persist the config durably:
 ///   1. write to `<path>.tmp`
@@ -550,6 +597,7 @@ pub async fn load_config() -> AppState {
 pub async fn save_config(state: &AppState) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
+    let _guard = SAVE_LOCK.lock().await;
     let cfg = PersistConfig::from(state);
     let contents = toml::to_string_pretty(&cfg).map_err(std::io::Error::other)?;
     let path = Path::new(paths::CONFIG_TOML);
@@ -568,6 +616,22 @@ pub async fn save_config(state: &AppState) -> std::io::Result<()> {
             .await?;
         f.write_all(contents.as_bytes()).await?;
         f.sync_all().await?;
+    }
+    // Keep the previous file as the backup, but only if it is itself complete
+    // (never overwrite a good backup with a damaged config).
+    if let Ok(old) = tokio::fs::read_to_string(path).await
+        && let Some(old_keys) = toml_key_count(&old)
+        && let Some(new_keys) = toml_key_count(&contents)
+        && old_keys * 10 >= new_keys * 7
+        && toml::from_str::<PersistConfig>(&old).is_ok()
+    {
+        let bak = backup_path();
+        let bak_tmp = format!("{bak}.tmp");
+        if tokio::fs::write(&bak_tmp, old.as_bytes()).await.is_ok()
+            && let Err(e) = tokio::fs::rename(&bak_tmp, &bak).await
+        {
+            log::warn!("Failed to update config backup: {}", e);
+        }
     }
     tokio::fs::rename(&tmp, path).await?;
     // Persist the directory entry so the rename itself survives power-loss.

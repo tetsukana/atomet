@@ -14,9 +14,16 @@ const ROW_STRIDE: usize = WIDTH + 2; // 1-byte padding each side
 /// At 640×360 (3:1 downsample from 1920×1080): effective pixel = 9.0µm
 /// focal_length_px = 3.1mm / 0.009mm ≈ 344
 pub const FOCAL_LENGTH_PX: f32 = 344.0;
+/// Lens profile fitted from validated solves of this camera (r = f·(θ + c3·θ³ + c5·θ⁵)).
+const DEFAULT_LENS_F: f64 = 382.7;
+const DEFAULT_LENS_C3: f64 = -0.0621;
+const DEFAULT_LENS_C5: f64 = -0.0246;
 /// Angular matching tolerance for vote accumulation (0.5° → cos)
 pub const DOT_THRESHOLD: f32 = 0.9999619; // cos(0.5°)
-pub const MAX_HYPOTHESES: usize = 200;
+/// Pattern-match hypotheses tried per attempt. 200 was too few once false stars (noise peaks) outnumber
+/// real ones: a clear 02:00 block with 45 genuine stars among 200 detections failed at 200 and solved at
+/// >=500 (votes 6). Host cost ~1 ms at 1000 (`crates/solver/examples/star_presence.rs`).
+pub const MAX_HYPOTHESES: usize = 1000;
 pub const EARLY_STOP_VOTES: usize = 6;
 
 // Cell grid constants (must match detection.rs)
@@ -114,9 +121,16 @@ pub fn solve_stars(
     let centered: Vec<(f32, f32)> = stars_px.iter().map(|&(x, y)| (x - cx, y - cy)).collect();
 
     let pinhole = LensModel::pinhole(FOCAL_LENGTH_PX as f64);
+    // Without a prior (fresh start, recalibration) the factory lens profile is
+    // tried before the blind pinhole: this camera's wide-angle distortion makes
+    // the pinhole attempt fail at the edge of the field (rms 2-3 px, REJECTED).
+    let default_lens = LensModel {
+        f: DEFAULT_LENS_F,
+        shape: calib::Shape::Poly { c3: DEFAULT_LENS_C3, c5: DEFAULT_LENS_C5 },
+    };
     let attempts: Vec<(LensModel, &str)> = match prior {
-        Some(p) => vec![(*p, "prior lens"), (pinhole, "pinhole")],
-        None => vec![(pinhole, "pinhole")],
+        Some(p) => vec![(*p, "prior lens"), (default_lens, "default lens"), (pinhole, "pinhole")],
+        None => vec![(default_lens, "default lens"), (pinhole, "pinhole")],
     };
     for (lens0, label) in attempts {
         // Pinhole coordinates for the pattern matcher, scale-matched to `lens0`.

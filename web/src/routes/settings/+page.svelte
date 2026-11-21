@@ -93,8 +93,11 @@
 		return bypassBits[bit] === 0;
 	}
 
+	// BCSH (bit 12) is pinned on by the daemon: turning it off doubled the noise.
+	const LOCKED_BITS = [12];
+
 	function setFeature(bit: number, on: boolean) {
-		if (!bypassBits) return;
+		if (!bypassBits || LOCKED_BITS.includes(bit)) return;
 		const next = bypassBits.slice();
 		next[bit] = on ? 0 : 1;
 		bypassBits = next;
@@ -620,7 +623,7 @@
 										<span class="isp-hint isp-hint-on">{t('★ meteor: on')}</span>
 									{/if}
 								</span>
-								<input type="checkbox" checked={isFeatureOn(tog.bit)}
+								<input type="checkbox" checked={isFeatureOn(tog.bit)} disabled={LOCKED_BITS.includes(tog.bit)}
 									onchange={(e) => setFeature(tog.bit, e.currentTarget.checked)} />
 							</label>
 						{/each}

@@ -49,6 +49,15 @@ const STREAK_DIFF_THRESHOLD: u8 = 10; // pixel diff floor inside blob ROI
 const STREAK_MIN_ELONG: f32 = 6.0; // pixel-level λ1/λ2 to accept a streak
 const STREAK_MIN_LEN_PX: f32 = 16.0; // full-extent length floor (≈ 2 cells)
 const STREAK_MIN_FLUX: u64 = 300; // sum of diff≥threshold px; rejects faint noise/hot-pixel lines
+// A short-path streak whose end comes this close to the image border is sensor-edge
+// noise (bright rows/columns at the border), not a meteor: on 2026-11-14 all 6 short
+// events were such lines (ends within 6 px of the border, 1 frame, 16-21 px/frame).
+// Meteors that cross the border are still caught by the tracked path or the FF pass.
+const STREAK_EDGE_PX: f32 = 6.0;
+// Short streaks must also be this long. On the dark, high-gain night of 2026-11-19/20 the
+// detector raised 4,550 short events (median 19 px, i.e. just above STREAK_MIN_LEN_PX) and none was a
+// meteor; on the quiet night before 64% of the short events were >= 30 px.
+const SHORT_MIN_LEN_PX: f32 = 30.0;
 
 // Tuning — tracker
 const TRACK_MAX_DIST: f32 = 5.0; // max residual distance to predicted position (cells)
@@ -60,6 +69,14 @@ const TRACK_MAX_HISTORY: usize = 64; // sliding window cap on centroid history
 const TRACK_MAX_EVENT_FRAMES: u32 = 75; // ~3s @ 25fps — longer-lived = aircraft/satellite
 const TRACK_MIN_MONOTONIC: f32 = 0.8; // fraction of steps advancing along the principal axis
 const TRACK_MIN_SPEED_CELLS: f32 = 0.0625; // 0.5 px/frame — slower = satellite/aircraft
+// Faster than this is noise blobs chained across the frame: on 2026-11-19/20 all 735 confirmed
+// tracks were exactly 4 frames at a median 36 px/frame (the linking limit, TRACK_MAX_DIST), while
+// the real meteors of the quiet nights were <= 14 px/frame (90th percentile) and the real ones
+// seen in the FF pass 1.9-10.7 px/frame.
+const TRACK_MAX_SPEED_CELLS: f32 = 3.0; // 24 px/frame
+// A track whose points mostly lie within this many cells (12 px) of the image border follows
+// sensor-edge noise (bright rows/columns), e.g. x = 1..12 px running down the left edge.
+const TRACK_EDGE_CELLS: f32 = 1.5;
 
 /// Frame rate the per-frame tuning constants above were set at. The ones that
 /// are really durations or speeds (EMA_ALPHA, TRACK_MAX_EVENT_FRAMES,
@@ -77,6 +94,8 @@ struct Timing {
     max_event_frames: u32,
     /// Minimum speed in cells/frame (same cells/s as at REF_FPS).
     min_speed_cells: f32,
+    /// Maximum speed in cells/frame (same cells/s as at REF_FPS).
+    max_speed_cells: f32,
 }
 
 impl Timing {
@@ -89,12 +108,14 @@ impl Timing {
                 ema_alpha: EMA_ALPHA,
                 max_event_frames: TRACK_MAX_EVENT_FRAMES,
                 min_speed_cells: TRACK_MIN_SPEED_CELLS,
+                max_speed_cells: TRACK_MAX_SPEED_CELLS,
             };
         }
         Timing {
             ema_alpha: 1.0 - (1.0 - EMA_ALPHA).powf(r),
             max_event_frames: ((TRACK_MAX_EVENT_FRAMES as f32 / r).round() as u32).max(1),
             min_speed_cells: TRACK_MIN_SPEED_CELLS * r,
+            max_speed_cells: TRACK_MAX_SPEED_CELLS * r,
         }
     }
 }
@@ -459,6 +480,17 @@ struct StreakStats {
     uy: f32,
 }
 
+/// True if either end of the streak's principal-axis segment lies within
+/// `STREAK_EDGE_PX` of the image border (px, 640×360).
+fn streak_near_edge(s: &StreakStats) -> bool {
+    let half = s.length / 2.0;
+    let (w, h) = (IMG_WIDTH as f32 - 1.0, IMG_HEIGHT as f32 - 1.0);
+    [-half, half].iter().any(|&t| {
+        let (x, y) = (s.cx + s.ux * t, s.cy + s.uy * t);
+        x < STREAK_EDGE_PX || y < STREAK_EDGE_PX || x > w - STREAK_EDGE_PX || y > h - STREAK_EDGE_PX
+    })
+}
+
 /// Intensity-weighted second moments of the saturating diff (cur − prev)
 /// inside the blob's pixel ROI (blob is in cell coords; padded by one cell).
 /// Raw moments accumulate in u64 (exact); covariance/eigen in f64.
@@ -643,13 +675,26 @@ impl Track {
         })
     }
 
-    /// `min_speed_cells`: speed floor in cells/frame (see `Timing`).
-    fn is_confirmed(&self, min_speed_cells: f32) -> bool {
+    /// True when at least half of the history lies within `TRACK_EDGE_CELLS` of the image border.
+    fn hugs_border(&self) -> bool {
+        let (w, h) = (CELLS_X as f32, CELLS_Y as f32);
+        let near = self
+            .history
+            .iter()
+            .filter(|p| p.0 < TRACK_EDGE_CELLS || p.1 < TRACK_EDGE_CELLS || p.0 > w - TRACK_EDGE_CELLS || p.1 > h - TRACK_EDGE_CELLS)
+            .count();
+        near * 2 >= self.history.len()
+    }
+
+    /// `min_speed_cells` / `max_speed_cells`: speed window in cells/frame (see `Timing`).
+    fn is_confirmed(&self, min_speed_cells: f32, max_speed_cells: f32) -> bool {
         !self.rejected
+            && !self.hugs_border()
             && self.metrics().is_some_and(|m| {
                 m.linearity >= TRACK_MIN_LINEARITY
                     && m.monotonic >= TRACK_MIN_MONOTONIC
                     && m.speed >= min_speed_cells
+                    && m.speed <= max_speed_cells
             })
     }
 }
@@ -963,7 +1008,7 @@ pub fn detection_task(
                 confirmed_ids.push(tr.id);
                 continue;
             }
-            if tr.is_confirmed(timing.min_speed_cells) {
+            if tr.is_confirmed(timing.min_speed_cells, timing.max_speed_cells) {
                 tr.confirmed = true;
                 confirmed_ids.push(tr.id);
 
@@ -1080,7 +1125,11 @@ pub fn detection_task(
                 continue;
             }
             let s = tr.best_streak;
-            if s.flux < STREAK_MIN_FLUX || s.elongation < STREAK_MIN_ELONG || s.length < STREAK_MIN_LEN_PX {
+            if s.flux < STREAK_MIN_FLUX || s.elongation < STREAK_MIN_ELONG || s.length < STREAK_MIN_LEN_PX.max(SHORT_MIN_LEN_PX) {
+                continue;
+            }
+            if streak_near_edge(&s) {
+                log::debug!("short streak rejected at the border: id={} c=({:.0},{:.0}) len={:.0}px", tr.id, s.cx, s.cy, s.length);
                 continue;
             }
 
@@ -1207,6 +1256,44 @@ pub fn detection_task(
     }
 }
 #[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    /// Streak from (x0,y0) to (x1,y1), as the principal-axis segment.
+    fn seg(x0: f32, y0: f32, x1: f32, y1: f32) -> StreakStats {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt();
+        StreakStats { cx: (x0 + x1) / 2.0, cy: (y0 + y1) / 2.0, length: len, ux: dx / len, uy: dy / len, ..Default::default() }
+    }
+
+    /// The six false short events of 2026-11-14 (all at the top/left border).
+    #[test]
+    fn border_noise_is_rejected() {
+        for (x0, y0, x1, y1) in [
+            (4.0, 4.0, 21.0, 0.0),
+            (1.0, 83.0, 1.0, 99.0),
+            (-1.0, 19.0, 4.0, 1.0),
+            (121.0, 1.0, 143.0, 0.0),
+            (3.0, 3.0, 20.0, 0.0),
+            (3.0, 6.0, 17.0, -2.0),
+        ] {
+            assert!(streak_near_edge(&seg(x0, y0, x1, y1)), "({x0},{y0})->({x1},{y1})");
+        }
+    }
+
+    #[test]
+    fn interior_and_other_borders() {
+        assert!(!streak_near_edge(&seg(300.0, 180.0, 320.0, 190.0)));
+        assert!(!streak_near_edge(&seg(100.0, 40.0, 130.0, 70.0)));
+        // 7 px from the left border and 8 px from the top: kept
+        assert!(!streak_near_edge(&seg(7.0, 8.0, 40.0, 60.0)));
+        // bottom / right borders are covered too
+        assert!(streak_near_edge(&seg(200.0, 340.0, 210.0, 359.0)));
+        assert!(streak_near_edge(&seg(620.0, 100.0, 639.0, 110.0)));
+    }
+}
+
+#[cfg(test)]
 mod timing_tests {
     use super::*;
 
@@ -1216,6 +1303,7 @@ mod timing_tests {
         assert_eq!(t.ema_alpha, EMA_ALPHA);
         assert_eq!(t.max_event_frames, TRACK_MAX_EVENT_FRAMES);
         assert_eq!(t.min_speed_cells, TRACK_MIN_SPEED_CELLS);
+        assert_eq!(t.max_speed_cells, TRACK_MAX_SPEED_CELLS);
     }
 
     #[test]
@@ -1229,5 +1317,41 @@ mod timing_tests {
         let per_sec_ref = (1.0 - EMA_ALPHA).powi(25);
         let per_sec = (1.0 - t.ema_alpha).powi(15);
         assert!((per_sec - per_sec_ref).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod track_gate_tests {
+    use super::*;
+
+    fn track(points: &[(f32, f32)]) -> Track {
+        let mut t = Track::new(1, points[0].0, points[0].1, 0, StreakStats::default());
+        for &p in &points[1..] {
+            t.push(p);
+        }
+        t
+    }
+
+    fn confirmed(points: &[(f32, f32)]) -> bool {
+        let timing = Timing::new(25);
+        track(points).is_confirmed(timing.min_speed_cells, timing.max_speed_cells)
+    }
+
+    #[test]
+    fn ordinary_meteor_track_is_confirmed() {
+        // ~1.8 cells/frame (14 px/frame), straight, well inside the image
+        assert!(confirmed(&[(30.0, 20.0), (31.5, 21.0), (33.0, 22.0), (34.5, 23.0)]));
+    }
+
+    #[test]
+    fn noise_chained_at_the_linking_limit_is_rejected() {
+        // 5 cells/frame = 40 px/frame: what 735 noise tracks looked like on the dark night
+        assert!(!confirmed(&[(30.0, 20.0), (35.0, 20.0), (40.0, 20.0), (45.0, 20.0)]));
+    }
+
+    #[test]
+    fn track_along_the_border_is_rejected() {
+        // runs down the left edge (x ~ 0.2 cells = 2 px)
+        assert!(!confirmed(&[(0.2, 10.0), (0.2, 12.0), (0.1, 14.0), (0.1, 16.0)]));
     }
 }
