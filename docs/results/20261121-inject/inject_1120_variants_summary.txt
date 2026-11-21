@@ -1,0 +1,37 @@
+blocks read 1758, unreadable 0, dirs unreadable 0; clean 1688, sampled 150
+baseline detections on all 1758 scanned blocks (no injection; includes real meteors/aircraft):
+  new                                A    38  B     7  C     35
+  A12                                A    42  B     7  C     34
+  B10                                A    38  B     7  C     49
+  B8                                 A    38  B     7  C     49
+wrote inject_1120_v.csv
+
+detection rate by peak excess A (over all L, v; cumulative tiers: A / A+B / any):
+  new
+    A=   10  n= 2400  A   0.0%  A+B   0.0%  any   0.0%
+    A=   14  n= 2400  A   0.0%  A+B   0.2%  any   0.2%
+    A=   20  n= 2400  A   0.0%  A+B   1.1%  any   1.2%
+    A=   30  n= 2400  A  10.4%  A+B  11.4%  any  11.9%
+    A=   50  n= 2400  A  88.5%  A+B  89.7%  any  90.0%
+    A=  100  n= 2400  A  90.3%  A+B  90.5%  any  90.7%
+  A12
+    A=   10  n= 2400  A   0.0%  A+B   0.0%  any   0.0%
+    A=   14  n= 2400  A   0.3%  A+B   0.3%  any   0.3%
+    A=   20  n= 2400  A   1.3%  A+B   1.5%  any   1.5%
+    A=   30  n= 2400  A  10.5%  A+B  11.4%  any  12.0%
+    A=   50  n= 2400  A  88.5%  A+B  89.7%  any  90.0%
+    A=  100  n= 2400  A  90.3%  A+B  90.5%  any  90.7%
+  B10
+    A=   10  n= 2400  A   0.0%  A+B   0.0%  any   0.0%
+    A=   14  n= 2400  A   0.0%  A+B   0.3%  any   0.4%
+    A=   20  n= 2400  A   0.0%  A+B   1.1%  any   1.3%
+    A=   30  n= 2400  A  10.4%  A+B  11.4%  any  11.9%
+    A=   50  n= 2400  A  88.5%  A+B  89.7%  any  90.0%
+    A=  100  n= 2400  A  90.3%  A+B  90.5%  any  90.7%
+  B8
+    A=   10  n= 2400  A   0.0%  A+B   0.0%  any   0.0%
+    A=   14  n= 2400  A   0.0%  A+B   0.3%  any   0.4%
+    A=   20  n= 2400  A   0.0%  A+B   1.1%  any   1.3%
+    A=   30  n= 2400  A  10.4%  A+B  11.4%  any  11.9%
+    A=   50  n= 2400  A  88.5%  A+B  89.7%  any  90.0%
+    A=  100  n= 2400  A  90.3%  A+B  90.5%  any  90.7%

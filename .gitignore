@@ -27,3 +27,7 @@ drivers/sensors-t31/gc2053/.tmp_versions/
 data/hip_main.dat
 data/hip_main.dat.gz
 data/hyg.csv
+
+# Research-only FF detector tools (local; they include atometd/src/ff_detect.rs with #[path])
+crates/solver/examples/ff_redetect.rs
+crates/solver/examples/ff_inject.rs
